@@ -1,0 +1,27 @@
+# Generated simulation outputs
+data/generated/*
+!data/generated/.gitkeep
+
+# Slurm job logs
+logs/*.out
+logs/*.err
+!logs/.gitkeep
+
+# R session artifacts
+.Rhistory
+.Rapp.history
+.RData
+.Ruserdata
+.Rproj.user/
+*.Rproj
+
+# Compiled / cache
+*.rds.tmp
+*.o
+*.so
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp

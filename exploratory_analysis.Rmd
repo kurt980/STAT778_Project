@@ -1,0 +1,788 @@
+---
+title: "Exploratory Analysis"
+author: "Kurt"
+date: "4/14/2026"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# This file is for running some exloratory analysis code
+
+04/14: Illustrate how Copula works
+
+```{r}
+# 1. SETUP AND DATA GENERATION ------------------------------------------------
+# Load required libraries
+library(MASS)
+library(spaMM)   # For the Generalized Linear Geostatistical Model (GLGM)
+library(gcKrig)  # For the Gaussian Copula Model
+library(ggplot2)
+library(tidyr)
+
+# Generate the 10x10 Forest Grid
+set.seed(123)
+n_side <- 10
+x <- rep(1:n_side, times = n_side)
+y <- rep(1:n_side, each = n_side)
+coords <- cbind(x, y)
+
+# Create the hidden continuous spatial layer (Exponential correlation)
+distance_matrix <- as.matrix(dist(coords))
+phi <- 3 
+spatial_cov <- exp(-distance_matrix / phi)
+hidden_layer <- mvrnorm(n = 1, mu = rep(0, 100), Sigma = spatial_cov)
+
+# Convert to discrete Poisson counts
+base_rate <- 2 
+lambda <- exp(log(base_rate) + hidden_layer) 
+tree_counts <- rpois(n = 100, lambda = lambda)
+
+forest_data <- data.frame(x = x, y = y, trees = tree_counts)
+
+# 2. TRAIN / TEST SPLIT -------------------------------------------------------
+# Randomly select 20 locations to "hide" and use for testing
+set.seed(42)
+test_indices <- sample(1:100, 20)
+
+train_data <- forest_data[-test_indices, ]
+test_data  <- forest_data[test_indices, ]
+
+train_coords <- cbind(train_data$x, train_data$y)
+test_coords  <- cbind(test_data$x, test_data$y)
+
+# 3. TRAIN MODELS AND PREDICT -------------------------------------------------
+
+# --- Model A: GLGM (The "Hidden Layer" Model) ---
+cat("Fitting GLGM...\n")
+glgm_model <- fitme(
+  trees ~ 1 + Matern(1 | x + y), 
+  data = train_data, 
+  family = poisson()
+)
+
+# Predict GLGM expected counts
+# type = "response" ensures the predictions are brought back to the count scale
+glgm_preds <- predict(glgm_model, newdata = test_data, type = "response")
+
+# --- Model B: Gaussian Copula (gcKrig) ---
+cat("Fitting Copula Model...\n")
+# Note: For toy speed, we lower the GHK simulation reps. 
+# In a real study, increase nrep to c(100, 1000) for higher accuracy.
+copula_model <- mlegc(
+  y = train_data$trees, 
+  locs = train_coords, 
+  marginal = poisson.gc(link = "log"), 
+  corr = matern.gc(kappa = 0.5, nugget = FALSE), 
+  method = "GHK",
+  ghkoptions = list(nrep = c(50, 100), reorder = FALSE, seed = 123)
+)
+
+cat("Predicting with Copula Model...\n")
+copula_preds_obj <- predgc(
+  obs.y = train_data$trees,
+  obs.locs = train_coords,
+  pred.locs = test_coords,
+  marginal = poisson.gc(link = "log"),
+  corr = matern.gc(kappa = 0.5, nugget = FALSE),
+  # Remove the 'estpar' line entirely
+  method = "GHK",
+  ghkoptions = list(nrep = c(50, 100), reorder = FALSE, seed = 123)
+)
+
+# Extract the predicted mean counts
+copula_preds <- summary(copula_preds_obj)$predMean
+
+
+# 4. PERFORMANCE EVALUATION ---------------------------------------------------
+# Create a dataframe to compare predictions with the truth
+results <- data.frame(
+  Location = 1:20,
+  True_Count = test_data$trees,
+  GLGM_Pred = as.numeric(glgm_preds),
+  Copula_Pred = as.numeric(copula_preds)
+)
+
+# Calculate Mean Absolute Error (MAE) and Root Mean Squared Error (RMSE)
+glgm_mae <- mean(abs(results$True_Count - results$GLGM_Pred))
+copula_mae <- mean(abs(results$True_Count - results$Copula_Pred))
+
+glgm_rmse <- sqrt(mean((results$True_Count - results$GLGM_Pred)^2))
+copula_rmse <- sqrt(mean((results$True_Count - results$Copula_Pred)^2))
+
+cat("\n--- PERFORMANCE EVALUATION ---\n")
+cat(sprintf("GLGM   - MAE: %.3f | RMSE: %.3f\n", glgm_mae, glgm_rmse))
+cat(sprintf("Copula - MAE: %.3f | RMSE: %.3f\n", copula_mae, copula_rmse))
+
+
+# 5. VISUAL ILLUSTRATION ------------------------------------------------------
+# Let's visualize the True vs Predicted values side-by-side using a scatter plot
+plot_data <- results %>%
+  pivot_longer(cols = c("GLGM_Pred", "Copula_Pred"), 
+               names_to = "Model", 
+               values_to = "Prediction")
+
+# Clean up model names for the plot
+plot_data$Model <- ifelse(plot_data$Model == "GLGM_Pred", "GLGM", "Copula (gcKrig)")
+
+ggplot(plot_data, aes(x = True_Count, y = Prediction, color = Model)) +
+  geom_point(size = 3, alpha = 0.8) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "black") + # The "Perfect Prediction" line
+  scale_color_manual(values = c("GLGM" = "#E69F00", "Copula (gcKrig)" = "#56B4E9")) +
+  theme_minimal() +
+  labs(
+    title = "Prediction Accuracy: True vs. Predicted Tree Counts",
+    subtitle = "Points closer to the dashed line indicate better predictions",
+    x = "True Observed Count (Hold-out Test Set)",
+    y = "Predicted Count"
+  ) +
+  theme(plot.title = element_text(face = "bold", size = 14))
+```
+
+```{r}
+# -----------------------------------------------------------------------------
+# ZERO-COMPUTATION HEATMAPS
+# -----------------------------------------------------------------------------
+library(ggplot2)
+
+# 1. STITCH PREDICTIONS BACK INTO THE GRID
+# Create copies of the original forest_data
+grid_glgm <- forest_data
+grid_copula <- forest_data
+
+# Overwrite ONLY the 20 hidden "test" locations with the models' predictions
+grid_glgm$trees[test_indices] <- as.numeric(glgm_preds)
+grid_copula$trees[test_indices] <- as.numeric(copula_preds)
+
+
+# 2. CREATE A SIMPLE PLOTTING FUNCTION
+# This keeps the code short and clean
+plot_simple_heatmap <- function(data_to_plot, title_text) {
+  ggplot(data_to_plot, aes(x = x, y = y, fill = trees)) +
+    geom_tile(color = "white", linewidth = 0.5) +
+    
+    # Add the numbers on top (rounded to 1 decimal for predictions)
+    geom_text(aes(label = round(trees, 1)), size = 3.5,
+              color = ifelse(data_to_plot$trees > mean(data_to_plot$trees), "white", "black")) +
+    
+    scale_fill_viridis_c(option = "viridis", name = "Tree Count") +
+    coord_fixed() + 
+    theme_minimal() +
+    labs(title = title_text, x = "X", y = "Y") +
+    theme(plot.title = element_text(face = "bold", size = 14),
+          panel.grid = element_blank())
+}
+
+
+# 3. PRINT THE THREE PLOTS (Safely!)
+# Run these one by one in your console
+
+# Plot 1: The absolute truth (all 100 points)
+plot_1 <- plot_simple_heatmap(forest_data, "1. True Data")
+print(plot_1)
+
+# Plot 2: GLGM (80 True + 20 Predicted)
+plot_2 <- plot_simple_heatmap(grid_glgm, "2. GLGM (80 True + 20 Predicted)")
+print(plot_2)
+
+# Plot 3: gcKrig (80 True + 20 Predicted)
+plot_3 <- plot_simple_heatmap(grid_copula, "3. gcKrig (80 True + 20 Predicted)")
+print(plot_3)
+```
+
+
+---
+
+Another simple example of spatial count data and using gcKrig
+
+```{r}
+# install.packages(c("gcKrig", "ggplot2", "patchwork"))
+
+library(gcKrig)
+library(ggplot2)
+library(patchwork)
+
+set.seed(1234)
+
+# ------------------------------------------------------------
+# 1. create a simple spatial grid
+# ------------------------------------------------------------
+
+grid <- seq(0.05, 0.95, by = 0.1)
+locs <- expand.grid(x = grid, y = grid)
+
+n_all <- nrow(locs)
+
+# ------------------------------------------------------------
+# 2. generate one simple spatial count dataset
+#    true model:
+#    - negative binomial marginal
+#    - mean depends on x and y
+#    - matern spatial correlation
+# ------------------------------------------------------------
+
+mu_true <- exp(1 + 0.8 * locs$x - 0.8 * locs$y)
+
+sim_obj <- simgc(
+  locs = as.matrix(locs),
+  sim.n = 1,
+  marginal = negbin.gc(mu = mu_true, od = 0.6),
+  corr = matern.gc(range = 0.25, kappa = 0.5, nugget = 0.05)
+)
+
+y_all <- sim_obj$data
+if (is.matrix(y_all)) {
+  y_all <- y_all[, 1]
+}
+
+full_df <- data.frame(
+  x = locs$x,
+  y = locs$y,
+  true_count = y_all
+)
+
+# extract simulated counts robustly
+if (is.matrix(sim_obj$data) || is.data.frame(sim_obj$data)) {
+  y_all <- as.numeric(sim_obj$data[, 1])
+} else {
+  y_all <- as.numeric(sim_obj$data)
+}
+
+length(y_all)
+nrow(locs)
+
+# ------------------------------------------------------------
+# 3. split into observed and hidden locations
+# ------------------------------------------------------------
+
+obs_idx <- sample(seq_len(n_all), size = 70, replace = FALSE)
+pred_idx <- setdiff(seq_len(n_all), obs_idx)
+
+obs_locs <- as.matrix(locs[obs_idx, c("x", "y")])
+pred_locs <- as.matrix(locs[pred_idx, c("x", "y")])
+
+obs_x <- as.matrix(locs[obs_idx, c("x", "y")])
+pred_x <- as.matrix(locs[pred_idx, c("x", "y")])
+
+obs_y <- y_all[obs_idx]
+true_hidden <- y_all[pred_idx]
+
+# ------------------------------------------------------------
+# 4. fit gcKrig on observed data and predict hidden locations
+#    we use the correct marginal family here on purpose
+#    to test the basic workflow first
+# ------------------------------------------------------------
+
+pred_fit <- predgc(
+  obs.y = obs_y,
+  obs.x = obs_x,
+  obs.locs = obs_locs,
+  pred.x = pred_x,
+  pred.locs = pred_locs,
+  marginal = negbin.gc(link = "log"),
+  corr = matern.gc(kappa = 0.5, nugget = TRUE),
+  method = "GHK",
+  parallel = FALSE,
+  ghkoptions = list(nrep = c(100, 300), reorder = FALSE, seed = 1234)
+)
+
+pred_sum <- summary(pred_fit)
+
+pred_df <- data.frame(
+  x = pred_locs[, 1],
+  y = pred_locs[, 2],
+  true_count = true_hidden,
+  pred_mean = pred_sum$predMean,
+  pred_count = pred_sum$predCount,
+  pred_var = pred_sum$predVar
+)
+
+# ------------------------------------------------------------
+# 5. simple numerical performance summaries
+# ------------------------------------------------------------
+
+rmse_mean <- sqrt(mean((pred_df$pred_mean - pred_df$true_count)^2))
+mae_mean <- mean(abs(pred_df$pred_mean - pred_df$true_count))
+
+rmse_discrete <- sqrt(mean((pred_df$pred_count - pred_df$true_count)^2))
+mae_discrete <- mean(abs(pred_df$pred_count - pred_df$true_count))
+
+cat("RMSE using predictive mean:", round(rmse_mean, 3), "\n")
+cat("MAE using predictive mean :", round(mae_mean, 3), "\n")
+cat("RMSE using discrete predictor:", round(rmse_discrete, 3), "\n")
+cat("MAE using discrete predictor :", round(mae_discrete, 3), "\n")
+
+# ------------------------------------------------------------
+# 6. create fields for plotting
+# ------------------------------------------------------------
+
+plot_df <- full_df
+plot_df$observed <- FALSE
+plot_df$observed[obs_idx] <- TRUE
+
+# predicted field:
+# - keep observed sites at their true counts
+# - fill hidden sites with predicted discrete responses
+plot_df$predicted_field <- plot_df$true_count
+plot_df$predicted_field[pred_idx] <- pred_df$pred_count
+
+# absolute error only on hidden sites
+plot_df$abs_error_hidden <- NA_real_
+plot_df$abs_error_hidden[pred_idx] <- abs(pred_df$pred_count - pred_df$true_count)
+
+# ------------------------------------------------------------
+# 7. plots
+# ------------------------------------------------------------
+
+p1 <- ggplot(plot_df, aes(x, y, fill = true_count)) +
+  geom_tile() +
+  coord_equal() +
+  scale_fill_viridis_c() +
+  labs(
+    title = "True simulated count field",
+    fill = "count"
+  ) +
+  theme_minimal()
+
+p2 <- ggplot(plot_df, aes(x, y, fill = predicted_field)) +
+  geom_tile() +
+  coord_equal() +
+  scale_fill_viridis_c() +
+  labs(
+    title = "Observed + gcKrig predicted field",
+    fill = "count"
+  ) +
+  theme_minimal()
+
+p3 <- ggplot(plot_df, aes(x, y, fill = abs_error_hidden)) +
+  geom_tile(color = "grey85") +
+  coord_equal() +
+  scale_fill_viridis_c(na.value = "white") +
+  labs(
+    title = "Absolute error on hidden locations",
+    fill = "|error|"
+  ) +
+  theme_minimal()
+
+p4 <- ggplot(pred_df, aes(true_count, pred_count)) +
+  geom_point(size = 2, alpha = 0.8) +
+  geom_abline(intercept = 0, slope = 1, linetype = 2, color = "red") +
+  labs(
+    title = "Hidden locations: true vs predicted",
+    x = "true hidden count",
+    y = "predicted hidden count"
+  ) +
+  theme_minimal()
+
+(p1 | p2) / (p3 | p4)
+```
+
+---
+
+
+
+
+
+
+
+### Example of how Copula method works (not gcKrig)
+
+```{r}
+# =========================================================
+# example: how a copula reconstructs a bivariate distribution
+# =========================================================
+
+# packages
+library(copula)
+library(MASS)
+
+set.seed(123)
+
+# ---------------------------------------------------------
+# 1. define the true joint distribution
+# ---------------------------------------------------------
+
+# true dependence: Gaussian copula with rho = 0.7
+true_rho <- 0.7
+true_cop <- normalCopula(param = true_rho, dim = 2)
+
+# true marginals:
+# x1 ~ Gamma(shape = 2, rate = 1)
+# x2 ~ Lognormal(meanlog = 0.5, sdlog = 0.6)
+true_mvdc <- mvdc(
+  copula = true_cop,
+  margins = c("gamma", "lnorm"),
+  paramMargins = list(
+    list(shape = 2, rate = 1),
+    list(meanlog = 0.5, sdlog = 0.6)
+  )
+)
+
+# simulate "observed" data from the true model
+n <- 1000
+x <- rMvdc(n, true_mvdc)
+colnames(x) <- c("x1", "x2")
+
+# ---------------------------------------------------------
+# 2. visualize the true simulated data
+# ---------------------------------------------------------
+
+# helper function: draw 2d kernel density contour
+plot_density_contour <- function(data, main_title) {
+  kd <- kde2d(data[, 1], data[, 2], n = 100)
+  contour(kd,
+          main = main_title,
+          xlab = "x1",
+          ylab = "x2",
+          drawlabels = FALSE)
+}
+
+par(mfrow = c(2, 2))
+
+plot(x[, 1], x[, 2],
+     pch = 16, cex = 0.5,
+     xlab = "x1", ylab = "x2",
+     main = "true simulated data")
+
+hist(x[, 1], breaks = 30, main = "true x1 marginal", xlab = "x1")
+hist(x[, 2], breaks = 30, main = "true x2 marginal", xlab = "x2")
+
+plot_density_contour(x, "true joint density contour")
+
+# ---------------------------------------------------------
+# 3. fit marginal distributions separately
+# ---------------------------------------------------------
+
+# fit x1 with Gamma by MLE
+fit_x1 <- fitdistr(x[, 1], densfun = "gamma")
+shape_hat <- fit_x1$estimate["shape"]
+rate_hat  <- fit_x1$estimate["rate"]
+
+# fit x2 with Lognormal by MLE
+fit_x2 <- fitdistr(x[, 2], densfun = "lognormal")
+meanlog_hat <- fit_x2$estimate["meanlog"]
+sdlog_hat   <- fit_x2$estimate["sdlog"]
+
+cat("estimated marginal parameters:\n")
+cat("x1 gamma shape =", shape_hat, ", rate =", rate_hat, "\n")
+cat("x2 lognormal meanlog =", meanlog_hat, ", sdlog =", sdlog_hat, "\n\n")
+
+# ---------------------------------------------------------
+# 4. transform data to pseudo-uniforms using fitted marginals
+# ---------------------------------------------------------
+
+u1_hat <- pgamma(x[, 1], shape = shape_hat, rate = rate_hat)
+u2_hat <- plnorm(x[, 2], meanlog = meanlog_hat, sdlog = sdlog_hat)
+
+u_hat <- cbind(u1_hat, u2_hat)
+
+# avoid exact 0 or 1 for numerical stability
+eps <- 1e-6
+u_hat[u_hat < eps] <- eps
+u_hat[u_hat > 1 - eps] <- 1 - eps
+
+# ---------------------------------------------------------
+# 5. fit Gaussian copula to the transformed uniforms
+# ---------------------------------------------------------
+
+fit_cop <- fitCopula(
+  normalCopula(param = 0.3, dim = 2),
+  data = u_hat,
+  method = "ml"
+)
+
+rho_hat <- coef(fit_cop)[1]
+
+cat("true copula rho =", true_rho, "\n")
+cat("estimated copula rho =", rho_hat, "\n\n")
+
+# ---------------------------------------------------------
+# 6. construct the fitted joint model
+# ---------------------------------------------------------
+
+fitted_cop <- normalCopula(param = rho_hat, dim = 2)
+
+fitted_mvdc <- mvdc(
+  copula = fitted_cop,
+  margins = c("gamma", "lnorm"),
+  paramMargins = list(
+    list(shape = shape_hat, rate = rate_hat),
+    list(meanlog = meanlog_hat, sdlog = sdlog_hat)
+  )
+)
+
+# simulate from the fitted copula model
+x_hat <- rMvdc(n, fitted_mvdc)
+colnames(x_hat) <- c("x1", "x2")
+
+# ---------------------------------------------------------
+# 7. compare true data and fitted-copula-generated data
+# ---------------------------------------------------------
+
+par(mfrow = c(2, 2))
+
+plot(x[, 1], x[, 2],
+     pch = 16, cex = 0.5,
+     xlab = "x1", ylab = "x2",
+     main = "true simulated data")
+
+plot(x_hat[, 1], x_hat[, 2],
+     pch = 16, cex = 0.5,
+     xlab = "x1", ylab = "x2",
+     main = "data from fitted copula model")
+
+plot_density_contour(x, "true joint density contour")
+plot_density_contour(x_hat, "fitted joint density contour")
+
+# ---------------------------------------------------------
+# 8. optional: compare the copula layer directly
+# ---------------------------------------------------------
+
+par(mfrow = c(1, 2))
+
+plot(u_hat[, 1], u_hat[, 2],
+     pch = 16, cex = 0.5,
+     xlab = "u1_hat", ylab = "u2_hat",
+     main = "estimated uniforms from data")
+
+u_sim <- rCopula(n, fitted_cop)
+plot(u_sim[, 1], u_sim[, 2],
+     pch = 16, cex = 0.5,
+     xlab = "u1", ylab = "u2",
+     main = "simulated uniforms from fitted copula")
+```
+
+04/14: Replicate Paper's figure 1
+
+```{r}
+install.packages("gcKrig")
+library(gcKrig)
+
+# Simulate a spatial count dataset (from the paper's Figure 1)
+xloc <- seq(0, 1, length = 10)
+yloc <- seq(0, 1, length = 10)
+locs <- expand.grid(xloc, yloc)
+
+sim1 <- simgc(locs = cbind(locs[,1], locs[,2]), sim.n = 1,
+              marginal = negbin.gc(mu = 5, od = 1),
+              corr = matern.gc(range = 0.3, kappa = 0.5, nugget = 0.1))
+```
+
+
+
+```{r}
+###############################################################################
+# Replication of Han & De Oliveira (2018), Section 5 / Table 3
+# 
+# This script reproduces the package comparison simulation from the gcKrig
+# paper. It simulates a spatial count dataset on an 11x11 grid from a 
+# Gaussian copula model with:
+#   - Negative binomial marginals (with covariates)
+#   - Exponential correlation function (Matern with kappa = 0.5, no nugget)
+#
+# True parameters:
+#   beta0 = 1 (intercept), beta1 = 0.5 (covariate xloc), beta2 = 1 (covariate yloc)
+#   sigma^2 = 1 (overdispersion), range = 0.3
+#
+# The model is fit using gcKrig with both GHK and GQT methods, and we compare
+# parameter estimates, standard errors, log-likelihoods, and computation times.
+###############################################################################
+
+# ---- Load package ----
+library(gcKrig)
+
+# ---- Step 1: Set up the spatial grid ----
+# 11 x 11 regular grid on [0,1]^2 => 121 locations
+xloc <- rep(seq(0, 1, by = 0.1), 11)
+yloc <- rep(seq(0, 1, by = 0.1), each = 11)
+
+# Distance matrix (used later for mvtnorm comparison)
+simD <- as.matrix(dist(cbind(xloc, yloc)))
+
+# ---- Step 2: Simulate data ----
+# True parameters:
+#   log(mu(s)) = beta0 + beta1 * xloc + beta2 * yloc
+#   beta0 = 1, beta1 = 0.5, beta2 = 1
+#   overdispersion (od) = 1
+#   Matern correlation with range = 0.3, kappa = 0.5 (exponential), no nugget
+set.seed(321)
+simData1 <- simgc(
+  locs = cbind(xloc, yloc), 
+  sim.n = 1,
+  marginal = negbin.gc(mu = exp(1 + 0.5 * xloc + yloc), od = 1),
+  corr = matern.gc(range = 0.3, nugget = 0)
+)
+
+# Create data frame for model fitting
+simDf1 <- data.frame(xloc = xloc, yloc = yloc, data = simData1$data)
+
+cat("=== Simulated Data Summary ===\n")
+cat("Number of locations:", nrow(simDf1), "\n")
+cat("Count range:", range(simDf1$data), "\n")
+cat("Count mean:", round(mean(simDf1$data), 2), "\n\n")
+
+# ---- Step 3: Fit using gcKrig - GHK method ----
+cat("Fitting gcKrig with GHK method...\n")
+t0 <- proc.time()
+gcKrigGHK <- mlegc(
+  y = simDf1[, 3], 
+  x = simDf1[, 1:2],
+  locs = cbind(xloc, yloc), 
+  method = "GHK",
+  marginal = negbin.gc(link = "log"),
+  corr = matern.gc(nugget = FALSE),
+  ghkoptions = list(nrep = c(100, 1000), seed = 123)
+)
+tgcKrigGHK <- proc.time() - t0
+cat("  Done in", round(tgcKrigGHK["elapsed"], 1), "seconds\n\n")
+
+# ---- Step 4: Fit using gcKrig - GQT method ----
+cat("Fitting gcKrig with GQT method...\n")
+t0 <- proc.time()
+gcKrigGQT <- mlegc(
+  y = simDf1[, 3], 
+  x = simDf1[, 1:2],
+  locs = cbind(xloc, yloc), 
+  method = "GQT",
+  marginal = negbin.gc(link = "log"),
+  corr = matern.gc(nugget = FALSE)
+)
+tgcKrigGQT <- proc.time() - t0
+cat("  Done in", round(tgcKrigGQT["elapsed"], 1), "seconds\n\n")
+
+# ---- Step 5: Extract and compare results ----
+cat("=============================================\n")
+cat("  Replication of Han (2018) Table 3\n")
+cat("=============================================\n\n")
+
+# Extract estimates and standard errors
+ghk_est <- summary(gcKrigGHK)
+gqt_est <- summary(gcKrigGQT)
+
+# The summary object structure may vary; print the full summaries
+cat("--- gcKrig GHK Summary ---\n")
+print(summary(gcKrigGHK))
+cat("\n--- gcKrig GQT Summary ---\n")
+print(summary(gcKrigGQT))
+
+cat("\n=============================================\n")
+cat("  Comparison Table\n")
+cat("=============================================\n\n")
+
+# True parameter values for reference
+true_params <- c(beta0 = 1.0, beta1 = 0.5, beta2 = 1.0, sigma2 = 1.0, range = 0.3)
+cat("True parameters:\n")
+print(true_params)
+
+cat("\nTiming comparison:\n")
+cat("  GHK:", round(tgcKrigGHK["elapsed"], 1), "seconds\n")
+cat("  GQT:", round(tgcKrigGQT["elapsed"], 1), "seconds\n")
+
+# ---- Step 6: Visualize the simulated data ----
+cat("\n\nGenerating visualization of simulated data...\n")
+pdf("simulated_data_plot.pdf", width = 10, height = 4)
+par(mfrow = c(1, 3))
+
+# Plot 1: Counts at locations
+plot(xloc, yloc, cex = 0.5 + simDf1$data / max(simDf1$data) * 2,
+     pch = 19, col = "steelblue",
+     main = "Simulated Counts (size ~ count)",
+     xlab = "xloc", ylab = "yloc")
+
+# Plot 2: Histogram of counts
+hist(simDf1$data, breaks = 20, col = "lightblue", border = "white",
+     main = "Distribution of Counts", xlab = "Count", ylab = "Frequency")
+abline(v = mean(simDf1$data), col = "red", lwd = 2, lty = 2)
+
+# Plot 3: True mean surface
+mu_true <- exp(1 + 0.5 * xloc + yloc)
+plot(xloc, yloc, cex = 0.5 + mu_true / max(mu_true) * 2,
+     pch = 19, col = "darkorange",
+     main = "True Mean Surface (size ~ mu)",
+     xlab = "xloc", ylab = "yloc")
+
+dev.off()
+cat("Plot saved to simulated_data_plot.pdf\n")
+
+cat("\n=== Script complete ===\n")
+cat("This replicates the core workflow of Han (2018) Section 5.\n")
+cat("The exact numbers will differ slightly from the paper due to\n")
+cat("platform-specific RNG behavior, but the overall pattern should match.\n")
+```
+
+### 3.1 Simulate data using gcKrig
+
+```{r}
+# Load the package
+library(gcKrig)
+
+# 1. Create a 10x10 spatial grid of locations
+grid <- seq(0.05, 0.95, by = 0.1)
+xloc <- expand.grid(x = grid, y = grid)[, 1]
+yloc <- expand.grid(x = grid, y = grid)[, 2]
+
+# 2. Set seed for reproducibility
+set.seed(12345)
+
+# 3. Simulate the spatial count data
+# We specify a Negative Binomial marginal (mean = 5, overdispersion = 1)
+# We specify a Matern correlation (range = 0.3, kappa = 0.5, nugget = 0.1)
+sim1 <- simgc(locs = cbind(xloc, yloc), sim.n = 1,
+              marginal = negbin.gc(mu = 5, od = 1),
+              corr = matern.gc(range = 0.3, kappa = 0.5, nugget = 0.1))
+
+# 4. Visualize the data (will output a grid with exact text counts)
+plot(sim1, index = 1, plottype = "Text", col = 2)
+
+# You can also view it as a 3D scatter plot
+plot(sim1, index = 1, plottype = "3D", col = 2)
+```
+
+### Atlantic Fish
+
+```{r}
+# Load the built-in dataset
+data("AtlanticFish", package = "gcKrig")
+
+# Fit the Gaussian Copula Model using the GHK simulator
+Fitfish <- mlegc(y = AtlanticFish[, 3], 
+                 x = AtlanticFish[, 4:7],
+                 locs = AtlanticFish[, 1:2], 
+                 longlat = TRUE,
+                 marginal = negbin.gc(link = "log"),
+                 corr = matern.gc(kappa = 0.5, nugget = TRUE), 
+                 method = "GHK")
+
+# Review the parameter estimates and standard errors
+summary(Fitfish)
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```
+
+```{r}
+
+```

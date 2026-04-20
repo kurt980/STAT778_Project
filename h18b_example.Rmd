@@ -1,0 +1,171 @@
+---
+title: "H18-B: gcKrig Pipeline Example"
+author: "STAT778 Project"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+---
+
+```{r setup, include = FALSE}
+# This Rmd lives at the repo root (STAT778_Project/h18b_example.Rmd).
+# Every source code file is under code/; outputs go to data/ and logs/.
+# Nothing needs to be changed here because the working directory is
+# already the repo root.
+
+knitr::opts_chunk$set(
+  message = TRUE,
+  warning = FALSE,
+  fig.width  = 7,
+  fig.height = 6
+)
+```
+
+## What this notebook does
+
+Runs the H18-B generation pipeline interactively and inspects the
+result. This is the exact same work the Slurm job does, but inside
+RStudio where you can see each step.
+
+---
+
+## One-liner: run the full pipeline
+
+```{r run_full_pipeline}
+source("code/scripts/01_gen_h18b.R")
+```
+
+That's it. One file on disk: `data/generated/H18-B/default.rds`.
+Everything below is either inspecting that file or walking through
+the pipeline step by step for learning.
+
+---
+
+## Inspect the output
+
+```{r inspect}
+source("code/R/logging.R")
+source("code/R/io.R")
+
+s <- load_scenario("H18-B", "default")
+
+str(s, max.level = 1)
+```
+
+The full input spec is preserved verbatim:
+
+```{r config_roundtrip}
+str(s$config, max.level = 2)
+```
+
+Summary of the simulated counts:
+
+```{r summary}
+values <- s$values[, 1]
+summary(values)
+cat("zeros:", sum(values == 0), "of", length(values), "\n")
+```
+
+---
+
+## Visualize
+
+```{r plot}
+plot(
+  s$locations[, 1], s$locations[, 2],
+  pch = 19,
+  cex = 1 + 2 * values / max(values),
+  col = gray(1 - values / max(values)),
+  xlab = "x", ylab = "y",
+  main = "H18-B simulated counts (darker/bigger = higher)"
+)
+```
+
+---
+
+## Optional: step through the pipeline manually
+
+If you want to see what happens at each stage:
+
+```{r step_by_step, eval = FALSE}
+library(gcKrig)
+
+source("code/R/logging.R")
+source("code/R/grids.R")
+source("code/R/spec_utils.R")
+source("code/R/sim_core.R")
+source("code/R/io.R")
+source("code/configs/h18b.R")
+
+# Pick the paper target scenario
+spec <- H18B_SCENARIOS$default
+
+# 1. Build locations from the layout spec
+locs <- do.call(make_locations, spec$layout)
+
+# 2. Build gcKrig objects from the marginal + corr specs
+mu_vec <- exp(spec$marginal$beta[1] +
+              spec$marginal$beta[2] * locs[, 1] +
+              spec$marginal$beta[3] * locs[, 2])
+
+marginal_obj <- negbin.gc(mu = mu_vec, od = spec$marginal$od)
+corr_obj     <- matern.gc(range  = spec$corr$range,
+                          kappa  = spec$corr$kappa,
+                          nugget = spec$corr$nugget)
+
+# 3. Simulate (the wrapper handles seeding and logging)
+scenario <- simulate_mc_scenario(
+  spec      = spec,
+  locations = locs,
+  marginal  = marginal_obj,
+  corr      = corr_obj
+)
+
+# 4. Save
+save_scenario(scenario)
+```
+
+---
+
+## Optional: try a variant without editing any file
+
+```{r variant, eval = FALSE}
+library(gcKrig)
+source("code/R/logging.R")
+source("code/R/grids.R")
+source("code/R/spec_utils.R")
+source("code/R/sim_core.R")
+source("code/R/io.R")
+source("code/configs/h18b.R")
+
+variant <- h18b_spec("range_0.7", list(corr = list(range = 0.7)))
+
+locs_v <- do.call(make_locations, variant$layout)
+mu_v   <- exp(variant$marginal$beta[1] +
+              variant$marginal$beta[2] * locs_v[, 1] +
+              variant$marginal$beta[3] * locs_v[, 2])
+
+scenario_v <- simulate_mc_scenario(
+  spec      = variant,
+  locations = locs_v,
+  marginal  = negbin.gc(mu = mu_v, od = variant$marginal$od),
+  corr      = matern.gc(range  = variant$corr$range,
+                        kappa  = variant$corr$kappa,
+                        nugget = variant$corr$nugget)
+)
+
+save_scenario(scenario_v)
+
+list_scenarios("H18-B")  # should now show "default" and "range_0.7"
+```
+
+---
+
+## What's next
+
+- `sbatch code/slurm/01_gen_h18b.slurm` runs the same thing as a batch
+  job on a Hopper compute node.
+- To add a permanent variant, edit `code/configs/h18b.R` and append
+  to `H18B_SCENARIOS` there.
