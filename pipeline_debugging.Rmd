@@ -1,0 +1,47 @@
+---
+title: "gcKrig_example"
+author: "Kurt"
+date: "4/19/2026"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+04/21/2026
+
+Attempt to solve the dimension mismatch in source code: "sim_core.R"
+
+```{r}
+print()
+setwd("/scratch/cji4/STAT778_Project")
+source("code/R/logging.R")
+source("code/R/io.R")
+source("code/R/grids.R")
+source("code/R/spec_utils.R")
+source("code/R/sim_core.R")
+source("code/configs/k13a.R")
+library(gcKrig)
+
+spec <- K13A_SCENARIOS$default
+locs <- do.call(make_locations, spec$layout)
+scenario <- simulate_mc_scenario(
+  spec      = spec,
+  locations = locs,
+  marginal  = poisson.gc(lambda = spec$marginal$lambda),
+  corr      = matern.gc(range  = spec$corr$range,
+                        kappa  = spec$corr$kappa,
+                        nugget = spec$corr$nugget)
+)
+
+dim(scenario$values)   # should print: 49 30
+```
+
+
+
+
+
+
+
+

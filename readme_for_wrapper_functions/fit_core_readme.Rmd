@@ -1,0 +1,52 @@
+---
+title: "fit_core_readme"
+author: "Kurt"
+date: "4/21/2026"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### How `fit_core.R` works
+
+The file `code/R/fit_core.R` is a wrapper around `gcKrig::mlegc()`. It does not define a new statistical estimator. Instead, it standardizes how repeated fits are run and recorded.
+
+There are three main layers:
+
+1. **`.fit_one()`**  
+   Fits one replicate with one method (`"GHK"` or `"GQT"`).  
+   It:
+   - extracts one column from `scenario$values`,
+   - rebuilds the gcKrig marginal and correlation objects for fitting,
+   - calls `mlegc()`,
+   - catches any error instead of crashing,
+   - returns one row of results.
+
+2. **`fit_scenario()`**  
+   Repeats `.fit_one()` across all requested replicates and methods.  
+   If there are 30 replicates and 2 methods, it produces 60 rows:
+   one for each `(replicate, method)` pair.
+
+3. **`make_fit_result()`**  
+   Packages the full result into a standard object with:
+   - `dataset_id`
+   - `scenario_id`
+   - `scenario_config`
+   - `results`
+   - provenance fields like R version and gcKrig version
+
+So the fitting pipeline is:
+
+- **input:** one generated scenario object
+- **work:** fit each replicate by each requested method
+- **output:** one fit-result object with a long-format results table
+
+This wrapper is useful because simulation studies need more than just point estimates. They also need:
+- timing,
+- convergence status,
+- error messages,
+- and a consistent storage format across many runs.
+
+In short, `fit_core.R` is the bookkeeping layer that turns many repeated `mlegc()` calls into a reproducible simulation-study output.

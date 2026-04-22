@@ -1,0 +1,541 @@
+---
+title: "K13-A End-to-End: Generation, Fitting, Inspection"
+author: "STAT778 Project"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  message  = TRUE,
+  warning  = FALSE,
+  fig.width  = 7,
+  fig.height = 5
+)
+```
+
+## Purpose
+
+Walk through the full K13-A pipeline interactively: generate the pilot scenario, fit it with GHK and GQT, inspect results. Once this Rmd runs cleanly end to end, the Slurm equivalent is the same R code dispatched to a compute node for scale.
+
+**Safety convention.** Chunks that do heavy work (full fitting loop) are marked `eval = FALSE` by default. Knit this Rmd and it completes quickly; run those chunks manually when you actually want the expensive work to happen.
+
+---
+
+## Background and methodology
+
+This section explains what K13-A is, what the pipeline computes, and how to interpret the outputs. Treat it as a reference you can come back to.
+
+### What is K13-A
+
+K13-A refers to the main estimation study in Kazianka (2013), Section 4. Its goal is to measure how accurately one can recover the parameters of a Gaussian-copula spatial count model from simulated data, under two competing estimation methods: **GHK** (a simulated full likelihood) and **GQT** (a fast approximate likelihood).
+
+Kazianka ran the study across a grid of sample sizes, spatial dependence strengths, and marginal parameters, with 2000 Monte Carlo replicates per cell. Our `default` scenario is a single cell from that grid, a pilot, with `sim_n = 30` replicates.
+
+### Data-generating model
+
+At each replicate we simulate counts $Y(s_1), \ldots, Y(s_n)$ at $n$ spatial locations using a Gaussian copula:
+
+1. Draw a latent Gaussian random field $Z$ at the $n$ locations, with mean 0, variance 1, and correlation function
+   $$\rho(h) = \exp(-h / r),$$
+   where $h$ is Euclidean distance and $r$ is the **range parameter**. For our `default`, $r = 0.3$.
+
+2. Transform the latent field through a Gaussian copula to obtain spatially correlated Poisson counts with mean (intensity) $\lambda$. For our `default`, $\lambda = 5$.
+
+3. Locations are a regular grid. For `default`, this is a $7 \times 7$ grid on $[0, 1]^2$, giving $n = 49$.
+
+In short, each replicate is 49 correlated Poisson(5) counts on a regular grid, where the spatial correlation has range 0.3.
+
+**Parameters estimated from data:**
+
+| Parameter    | True value | Meaning                            |
+|--------------|:----------:|------------------------------------|
+| $\lambda$    | 5          | Poisson intensity (expected count) |
+| $r$ (range)  | 0.3        | Spatial dependence length          |
+
+**Parameters held fixed (known, not estimated):**
+
+| Parameter        | Value | Meaning                              |
+|------------------|:-----:|--------------------------------------|
+| $\kappa$         | 0.5   | Matern smoothness (0.5 = exponential) |
+| Nugget           | 0     | No independent measurement error     |
+| $n$ (grid size)  | 49    | Number of locations                  |
+
+### gcKrig's parameterization: log-link intercept
+
+A common confusion is worth spelling out. gcKrig fits the Poisson mean on the **log scale**:
+$$\log \lambda = \beta_0,$$
+so the parameter it estimates and calls `Intercept` is $\beta_0$, not $\lambda$ directly. The relationship is
+$$\lambda = \exp(\beta_0), \qquad \beta_0 = \log \lambda.$$
+
+For our truth $\lambda = 5$, this means
+$$\beta_0^{\text{true}} = \log(5) \approx 1.609.$$
+
+This matters when comparing estimates to truth: **estimates of `Intercept` should be compared to $\log(5) \approx 1.609$, not to 5.** The two are the same truth, just measured on different scales, like comparing temperatures in Celsius and Fahrenheit. gcKrig works in log-units because it keeps $\lambda$ guaranteed positive and because the log scale is standard for count regression. When covariates are added, the linear predictor is additive.
+
+### The two estimation methods
+
+**GHK** (Geweke–Hajivassiliou–Keane simulator) evaluates the true likelihood via Monte Carlo. It is accurate but potentially slow, and historically it is the gold standard for this class of model. In gcKrig this is `method = "GHK"`.
+
+**GQT** (generalized quantile transformation) replaces the exact likelihood with a surrogate that is much cheaper to evaluate. It is fast but approximate. It was proposed in Kazianka and Pilz (2010) and adopted in Kazianka (2013). In gcKrig this is `method = "GQT"`.
+
+Kazianka's headline finding is that GQT is hundreds or thousands of times faster than GHK with surprisingly similar accuracy, when the data are not too discrete. Poisson with moderate $\lambda$ is fine; Bernoulli is problematic.
+
+### What "converged" means
+
+Both methods numerically maximize a likelihood via `optim` with the L-BFGS-B algorithm inside gcKrig. "Converged" in our pipeline means simply that `mlegc()` returned without throwing an error. It does not separately check optimizer convergence codes, though those are available inside the returned object for a stricter definition.
+
+For a well-behaved pilot like `default`, we expect 100% convergence. Failures are informative when they happen. Usually a parameter hit a boundary or the likelihood surface was flat near the maximum.
+
+### What MAE means
+
+**Mean Absolute Error** for a parameter $\theta$:
+$$\mathrm{MAE}(\hat\theta) = \frac{1}{B} \sum_{b=1}^{B} |\hat\theta^{(b)} - \theta^{\text{true}}|,$$
+where $\hat\theta^{(b)}$ is the estimate from replicate $b$ and $B$ is the number of successful replicates. Smaller is better.
+
+MAE confounds **bias** (systematic over- or underestimation) and **variance** (replicate-to-replicate spread). For a fuller picture, look at the mean, standard deviation, and truth side by side.
+
+### What "good" looks like
+
+For the `default` pilot ($n = 49$, $r = 0.3$, $\lambda = 5$, $B = 30$), rough expectations based on Kazianka's Table 2 are:
+
+| Metric              | Expectation for both methods |
+|---------------------|------------------------------|
+| Convergence rate    | 100%                         |
+| Mean of $\hat\beta_0$ | near $\log 5 \approx 1.609$ |
+| Mean of $\hat r$    | near 0.3                     |
+| MAE of $\hat\beta_0$ | $\sim 0.05$ to $0.15$       |
+| MAE of $\hat r$     | $\sim 0.05$ to $0.10$        |
+| Runtime: GHK vs GQT | GQT faster                   |
+| GHK vs GQT MAEs     | similar                      |
+
+If observed numbers are in these ranges, we have replicated Kazianka's main conclusion: **GQT is competitive with GHK on accuracy while being substantially cheaper.**
+
+### Interpreting the boxplots
+
+Each boxplot summarizes 30 estimates. The dashed red line is the truth. A method is:
+
+- **Unbiased** if the box is centered on the red line.
+- **Efficient** if the box is narrow.
+- **Reliable** if there are few or no wild outliers.
+
+If both methods' boxes overlap heavily and are centered on the truth, we have replicated Kazianka's main finding for this cell.
+
+### Pilot vs full study
+
+`default` is one cell at $B = 30$. Kazianka uses the full grid at $B = 2000$. Scaling up means:
+
+- More replicates per cell: $B = 200$ for our project, $B = 2000$ for a paper-style run.
+- More cells: varying $\lambda \in \{1, 5, 10\}$, $r \in \{0.1, 0.3, 0.5\}$, $n \in \{25, 49, 81\}$.
+
+The pilot confirms the pipeline works and gives rough runtime numbers before committing to the expensive full run.
+
+---
+
+### Workflow: Rmarkdown vs Slurm
+
+This Rmd is a **development tool**, not the production execution path. There are two different modes.
+
+**How I plan to use them.** For each dataset the cycle is:
+
+1. **Write the Rmd first.** Load pipeline, verify it works on a small smoke test (one replicate), and inspect the output structure. This catches 90% of bugs in 5% of the compute.
+2. **Scale up via Slurm.** Once the Rmd smoke test is clean, the exact same pipeline code runs via the corresponding `.slurm` job, now at full replicate count and across every cell in the grid. Logs go to `logs/`, outputs to `data/fits/`.
+3. **Return to Rmd for analysis.** Load the Slurm-generated results via `load_fit_result()`, compute MAEs, make plots, and write the report.
+
+In this file specifically, Part 2 (smoke test) is safe to run inline. Part 3 (full fit) is marked `eval = FALSE` and should be launched via `sbatch code/slurm/10_fit_k13a.slurm` on Hopper when we move beyond the pilot.
+
+
+---
+
+
+## Load the pipeline
+
+```{r load_pipeline}
+suppressPackageStartupMessages({
+  library(gcKrig)
+})
+
+source("code/R/logging.R")
+source("code/R/grids.R")
+source("code/R/spec_utils.R")
+source("code/R/sim_core.R")
+source("code/R/io.R")
+source("code/R/fit_core.R")
+source("code/configs/k13a.R")
+```
+
+Quick sanity check that the config loaded:
+
+```{r show_config}
+names(K13A_SCENARIOS)
+str(K13A_SCENARIOS$default, max.level = 2)
+```
+
+---
+
+## Part 1: Generate (fast)
+
+Since you've already generated `default` via Slurm, the code below is here for reproducibility and for generating any new variants.
+
+### Option A: load the existing one if already generated
+
+```{r load_or_generate}
+scenario_path <- "data/generated/K13-A/default.rds"
+
+if (file.exists(scenario_path)) {
+  log_info("Scenario already generated; loading from disk.")
+  scenario <- load_scenario("K13-A", "default")
+} else {
+  log_info("Scenario not yet generated; creating now.")
+  spec <- K13A_SCENARIOS$default
+  locs <- do.call(make_locations, spec$layout)
+
+  marginal_obj <- poisson.gc(lambda = spec$marginal$lambda)
+  corr_obj     <- matern.gc(range  = spec$corr$range,
+                            kappa  = spec$corr$kappa,
+                            nugget = spec$corr$nugget)
+
+  scenario <- simulate_mc_scenario(
+    spec        = spec,
+    locations   = locs,
+    marginal    = marginal_obj,
+    corr        = corr_obj,
+    true_params = list(
+      lambda = spec$marginal$lambda,
+      range  = spec$corr$range,
+      kappa  = spec$corr$kappa,
+      nugget = spec$corr$nugget
+    )
+  )
+  save_scenario(scenario)
+}
+```
+
+### Quick look at what we have
+
+```{r scenario_summary}
+str(scenario, max.level = 1)
+cat("\n---\n")
+cat("n locations: ", nrow(scenario$locations), "\n")
+cat("n replicates:", ncol(scenario$values), "\n")
+cat("value range: [", min(scenario$values), ",", max(scenario$values), "]\n")
+cat("mean:        ", round(mean(scenario$values), 2), "\n")
+cat("zeros:       ", sum(scenario$values == 0),
+    "of", length(scenario$values), "\n")
+```
+
+### Peek at one replicate
+
+```{r plot_one_replicate}
+rep_i <- 1
+values_i <- scenario$values[, rep_i]
+
+plot(
+  scenario$locations[, "x"],
+  scenario$locations[, "y"],
+  pch  = 19,
+  cex  = 0.5 + 2 * values_i / max(values_i),
+  col  = hcl.colors(50, "YlOrRd", rev = TRUE)[
+    cut(values_i, breaks = 50, labels = FALSE)
+  ],
+  xlab = "x", ylab = "y",
+  main = sprintf("K13-A default, replicate %d", rep_i)
+)
+```
+
+---
+
+## Part 2: Smoke-test fitting (very fast)
+
+Before launching the full loop, fit one replicate with each method just to verify the fitting pipeline works. This should take under a minute total.
+
+```{r debug}
+setwd("/scratch/cji4/STAT778_Project")
+library(gcKrig)
+
+# Minimal test: does poisson.gc() work with no args?
+marg <- poisson.gc()
+class(marg)   # should include "marginal.gc"
+
+# And fit it to replicate 1 directly, bypassing fit_scenario:
+source("code/R/logging.R")
+source("code/R/io.R")
+scenario <- load_scenario("K13-A", "default")
+
+corr <- matern.gc(kappa = 0.5, nugget = FALSE)
+
+fit <- mlegc(
+  y        = scenario$values[, 1],
+  locs     = scenario$locations,
+  marginal = poisson.gc(),
+  corr     = corr,
+  method   = "GHK"
+)
+
+str(fit, max.level = 1)
+```
+
+```{r smoke_test_fit}
+log_info("Smoke test: fitting replicate 1 with GHK and GQT.")
+
+smoke_result <- fit_scenario(
+  scenario   = scenario,
+  methods    = c("GHK", "GQT"),
+  replicates = 1
+)
+
+smoke_result$results
+```
+
+Check what came back:
+
+```{r smoke_test_inspect}
+# Did both methods converge?
+smoke_result$results[, c("replicate", "method", "converged",
+                         "runtime_sec", "error_message")]
+
+# Parameter estimates from each method
+cat("\nGHK estimates:\n")
+print(smoke_result$results$estimates[[1]])
+
+cat("\nGQT estimates:\n")
+print(smoke_result$results$estimates[[2]])
+
+cat("\nTrue values:\n")
+print(scenario$true_params)
+```
+
+If both converged and the estimates are in the neighborhood of the true values (`lambda ~ 5`, `range ~ 0.3`), the pipeline works. If GHK errored out, read `smoke_result$results$error_message` to diagnose before proceeding.
+
+---
+
+## Part 3: Full fit (SLOW — runs manually)
+
+This chunk is `eval = FALSE` so a normal Knit skips it. Run it
+interactively (click the green arrow) when you want to do the real
+work.
+
+At n=49 with sim_n=30 and both methods, expect 15-60 minutes of wall
+time depending on hardware. Mostly GHK's time; GQT is essentially
+instant.
+
+```{r full_fit, eval = FALSE}
+log_info("Starting full fit loop for K13-A default (ALL replicates).")
+t0 <- Sys.time()
+
+fit_result <- fit_scenario(
+  scenario = scenario,
+  methods  = c("GHK", "GQT")
+)
+
+dt <- as.numeric(difftime(Sys.time(), t0, units = "mins"))
+log_info("Full fit complete in %.1f minutes.", dt)
+
+save_fit_result(fit_result)
+```
+
+### Verify it's saved
+
+```{r confirm_saved, eval = FALSE}
+list.files("data/fits/K13-A")
+```
+
+---
+
+## Part 4: Inspect results
+
+Reload from disk so this section works whether or not you just ran the full fit (as long as the fit has been done at some point).
+
+```{r load_fit_result}
+fit_result <- tryCatch(
+  load_fit_result("K13-A", "default"),
+  error = function(e) {
+    message("No fit result on disk yet. Run Part 3 first, or submit ",
+            "the Slurm fitting job.")
+    NULL
+  }
+)
+
+if (!is.null(fit_result)) {
+  str(fit_result, max.level = 1)
+}
+```
+
+The rest of this section assumes `fit_result` is non-NULL.
+
+### Convergence by method
+
+```{r convergence}
+if (!is.null(fit_result)) {
+  res <- fit_result$results
+  tab <- table(method = res$method, converged = res$converged)
+  print(tab)
+  cat("\nConvergence rates:\n")
+  print(round(prop.table(tab, margin = 1), 3))
+}
+```
+
+### Runtime summary by method
+
+```{r runtime}
+if (!is.null(fit_result)) {
+  ok <- res$converged
+  rt_summary <- aggregate(
+    runtime_sec ~ method,
+    data = res[ok, ],
+    FUN  = function(x) {
+      c(mean   = mean(x),
+        median = stats::median(x),
+        min    = min(x),
+        max    = max(x),
+        total  = sum(x))
+    }
+  )
+  print(rt_summary, digits = 3)
+
+  cat("\nSpeedup ratio (GHK mean / GQT mean):\n")
+  means <- tapply(res$runtime_sec[ok], res$method[ok], mean)
+  if (all(c("GHK", "GQT") %in% names(means))) {
+    cat(round(means["GHK"] / means["GQT"], 1), "x\n", sep = "")
+  }
+}
+```
+
+### Error messages (for any non-convergent fits)
+
+```{r errors}
+if (!is.null(fit_result)) {
+  failed <- res[!res$converged, ]
+  if (nrow(failed) == 0) {
+    cat("No failures.\n")
+  } else {
+    cat("Failed fits:\n")
+    print(failed[, c("replicate", "method", "error_message")])
+  }
+}
+```
+
+### Parameter-estimate distributions
+
+Pull the per-replicate estimates out of the list-column and summarize.
+
+```{r estimates_summary}
+if (!is.null(fit_result)) {
+  # Extract named estimates into long-format tidy data.
+  rows <- list()
+  for (i in seq_len(nrow(res))) {
+    if (!res$converged[i]) next
+    est <- res$estimates[[i]]
+    if (is.null(est)) next
+    for (pname in names(est)) {
+      rows[[length(rows) + 1]] <- data.frame(
+        replicate = res$replicate[i],
+        method    = res$method[i],
+        parameter = pname,
+        estimate  = as.numeric(est[[pname]]),
+        stringsAsFactors = FALSE
+      )
+    }
+  }
+  est_long <- do.call(rbind, rows)
+
+  if (!is.null(est_long) && nrow(est_long) > 0) {
+    # Summary statistics per (method, parameter)
+    summary_tab <- aggregate(
+      estimate ~ method + parameter,
+      data = est_long,
+      FUN  = function(x) c(mean = mean(x),
+                           sd   = sd(x),
+                           n    = length(x))
+    )
+    print(summary_tab, digits = 3)
+  }
+}
+
+print(summary_tab, digits = 3)
+```
+
+### Mean-absolute-error vs. truth
+
+```{r mae}
+if (!is.null(fit_result) && exists("est_long")) {
+  truth <- scenario$true_params
+  
+  # gcKrig names the Poisson intercept "Intercept" on the log scale.
+  # Our stored truth is lambda on the original scale. Translate.
+  if (!is.null(truth$lambda)) {
+    truth$Intercept <- log(truth$lambda)
+  }
+
+  est_long$truth <- NA_real_
+  for (i in seq_len(nrow(est_long))) {
+    tv <- truth[[est_long$parameter[i]]]
+    if (!is.null(tv) && length(tv) == 1L) {
+      est_long$truth[i] <- tv
+    }
+  }
+
+  est_long$abs_err <- abs(est_long$estimate - est_long$truth)
+
+  mae_tab <- aggregate(
+    abs_err ~ method + parameter,
+    data = est_long[!is.na(est_long$truth), ],
+    FUN  = mean
+  )
+  names(mae_tab)[3] <- "MAE"
+  print(mae_tab, digits = 3)
+}
+```
+
+This is the headline comparison: for each estimated parameter, how
+far is each method's estimate from the truth, on average? K13-A
+would then be replicated across the full (n, range, lambda) grid
+and these MAE numbers aggregated into the paper's Figure 1.
+
+### Visual: estimate distributions
+
+```{r plot_estimates, fig.width = 9, fig.height = 4}
+if (!is.null(fit_result) && exists("est_long") && nrow(est_long) > 0) {
+  params <- unique(est_long$parameter)
+  par(mfrow = c(1, length(params)))
+  on.exit(par(mfrow = c(1, 1)), add = TRUE)
+
+  for (p in params) {
+    d   <- est_long[est_long$parameter == p, ]
+    tv  <- truth[[p]]
+
+    boxplot(
+      estimate ~ method, data = d,
+      main = sprintf("%s  (truth = %s)", p,
+                     if (!is.null(tv)) format(tv, digits = 3) else "?"),
+      xlab = "method", ylab = "estimate"
+    )
+    if (!is.null(tv)) abline(h = tv, col = "red", lty = 2)
+  }
+}
+```
+
+---
+
+## Next steps
+
+If everything above ran cleanly:
+
+1. **Day 2 expansion.** Edit `code/configs/k13a.R` to add more cells
+   (vary `sim_n`, `lambda`, `range`, `n_side`). Regenerate via
+   `sbatch code/slurm/02_gen_k13a.slurm`, then fit via
+   `sbatch code/slurm/10_fit_k13a.slurm`.
+
+2. **K13-B and K13-C.** Separate pipeline (prediction, not fitting).
+   Needs new config + new prediction-pipeline library code. A
+   conversation for a later turn.
+
+3. **Misspecification extension.** Fit the generated K13-A data with a
+   wrong marginal family (say, negbin fitted to Poisson-generated
+   data). Requires a small extension to `fit_scenario()` to accept a
+   marginal-override argument. Also for a later turn.

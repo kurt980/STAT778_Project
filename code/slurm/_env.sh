@@ -2,31 +2,20 @@
 # File:    code/slurm/_env.sh
 # Purpose: Shared environment setup for all Slurm jobs.
 #
-# Sourced at the top of every code/slurm/*.slurm submission script.
-#
-# NOTE: Update the module commands below to match the module catalog
-#       available on your Hopper account. Check with:
-#
-#           module avail r
-#           module spider r
+# Sourced by every code/slurm/*.slurm submission script.
 # =====================================================================
 
 module purge 2>/dev/null || true
 
-# Load R. Adjust to whatever your site provides. Typical on GMU Hopper:
-#   module load gnu10
-#   module load r
-# or a versioned form:
-#   module load r/4.2.2-gy
-#
-# Uncomment and edit the line(s) that match your environment:
-# module load gnu10
-# module load r
+# R toolchain on Hopper. Keep gnu10 + r/4.3.1-gnu-openblas paired
+# together — this is the combination under which gcKrig is installed
+# in renv/library/R-4.3/.
+module load gnu10
+module load r/4.3.1-gnu-openblas
 
-# Personal R library (recommended on HPC):
-# export R_LIBS_USER="$HOME/R/library"
-
-# Deterministic BLAS threading:
+# Deterministic threading. The project pipeline uses R-level
+# parallelism (snowfall, etc.); leaving BLAS single-threaded
+# prevents oversubscription and reduces run-to-run variability.
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"

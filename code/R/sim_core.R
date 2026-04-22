@@ -120,13 +120,28 @@ simulate_mc_scenario <- function(spec,
   log_info("  simgc returned in %.3f sec", dt)
 
   raw <- sim_out$data
-  values <- if (is.matrix(raw)) raw else matrix(raw, ncol = 1L)
-
-  if (nrow(values) != nrow(locations) || ncol(values) != spec$sim_n) {
-    stop(sprintf(
-      "simulate_mc_scenario: unexpected simgc output shape %d x %d (expected %d x %d)",
-      nrow(values), ncol(values), nrow(locations), spec$sim_n
-    ))
+  
+  # simgc() returns:
+  #   - a length-n vector when sim.n == 1
+  #   - a sim_n x n matrix when sim.n > 1 (rows = replicates, cols = locations)
+  # Our scenario schema stores values as n x sim_n (rows = locations,
+  # cols = replicates), which is the natural "one column per dataset"
+  # convention for downstream code. Transpose when needed.
+  values <- if (is.matrix(raw)) {
+    if (nrow(raw) == spec$sim_n && ncol(raw) == nrow(locations)) {
+      t(raw)                          # transpose: (sim_n x n) -> (n x sim_n)
+    } else if (nrow(raw) == nrow(locations) && ncol(raw) == spec$sim_n) {
+      raw                             # already in expected orientation
+    } else {
+      stop(sprintf(
+        "simulate_mc_scenario: unexpected simgc output shape %d x %d (expected %d x %d or %d x %d)",
+        nrow(raw), ncol(raw),
+        nrow(locations), spec$sim_n,
+        spec$sim_n, nrow(locations)
+      ))
+    }
+  } else {
+    matrix(raw, ncol = 1L)
   }
 
   log_info(

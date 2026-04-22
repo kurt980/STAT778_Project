@@ -1,6 +1,6 @@
 ---
 title: "H18-B: gcKrig Pipeline Example"
-author: "STAT778 Project"
+author: "LeBron James"
 date: "`r Sys.Date()`"
 output:
   html_document:
@@ -37,9 +37,7 @@ RStudio where you can see each step.
 source("code/scripts/01_gen_h18b.R")
 ```
 
-That's it. One file on disk: `data/generated/H18-B/default.rds`.
-Everything below is either inspecting that file or walking through
-the pipeline step by step for learning.
+That's it. One file on disk: `data/generated/H18-B/default.rds`. Everything below is either inspecting that file or walking through the pipeline step by step for learning.
 
 ---
 
@@ -169,3 +167,154 @@ list_scenarios("H18-B")  # should now show "default" and "range_0.7"
   job on a Hopper compute node.
 - To add a permanent variant, edit `code/configs/h18b.R` and append
   to `H18B_SCENARIOS` there.
+
+
+---
+
+## Deep dive: inspecting H18-B
+
+### Load the scenario
+
+```{r inspect_load}
+source("code/R/logging.R")
+source("code/R/io.R")
+
+s <- load_scenario("H18-B", "default")
+values <- s$values[, 1]              # n-vector of counts
+locs   <- s$locations                # n x 2 matrix
+```
+
+### Scenario-level facts
+
+```{r inspect_facts}
+cat("Dataset:         ", s$dataset_id, "\n")
+cat("Scenario:        ", s$scenario_id, "\n")
+cat("Seed:            ", s$seed_info$seed, "\n")
+cat("gcKrig version:  ", s$gcKrig_version, "\n")
+cat("Created at:      ", format(s$created_at), "\n")
+cat("n locations:     ", nrow(locs), "\n")
+cat("n replicates:    ", ncol(s$values), "\n")
+```
+
+### Summary statistics of the simulated counts
+
+```{r inspect_summary}
+summary(values)
+
+cat("\nvariance = ", var(values), "\n")
+cat("variance / mean = ", var(values) / mean(values),
+    "  (> 1 indicates overdispersion)\n")
+
+cat("\nzeros:  ", sum(values == 0), " of ", length(values),
+    " (", round(100 * mean(values == 0), 1), "%)\n", sep = "")
+cat("max:    ", max(values), "\n")
+```
+
+Overdispersion should be well above 1 — the model has `od = 1`, meaning
+the variance/mean ratio of the marginal distribution is $1 + \mu$, so
+the overall empirical ratio should be substantially larger than the
+Poisson value of 1.
+
+### Distribution of counts
+
+```{r inspect_hist, fig.width = 7, fig.height = 4}
+hist(values,
+     breaks = seq(-0.5, max(values) + 0.5, by = 1),
+     col    = "gray80",
+     border = "white",
+     main   = "Distribution of simulated counts (H18-B)",
+     xlab   = "count value")
+```
+
+A long right tail is expected — that's what "overdispersed" looks like
+in practice.
+
+### Spatial pattern: gradient + local smoothness
+
+```{r inspect_spatial, fig.width = 7, fig.height = 6}
+# Use count magnitude for both size and color intensity
+size_scale  <- 0.5 + 2.5 * values / max(values)
+color_scale <- gray(1 - values / max(values))
+
+plot(
+  locs[, "x"], locs[, "y"],
+  pch  = 19,
+  cex  = size_scale,
+  col  = color_scale,
+  xlab = "x coordinate",
+  ylab = "y coordinate",
+  main = "H18-B spatial pattern",
+  xlim = c(-0.05, 1.05),
+  ylim = c(-0.05, 1.05)
+)
+
+# Overlay the count values for clarity
+text(locs[, "x"], locs[, "y"],
+     labels = values,
+     pos    = 3,            # above each point
+     cex    = 0.6,
+     col    = "red")
+```
+
+You should see two things:
+
+1. A **trend**: higher counts in the upper-right (where $\mu(s)$ is
+   largest), lower in the lower-left.
+2. **Local smoothness**: nearby points tend to have similar counts,
+   which is the spatial correlation at work. This is the whole point
+   of the copula model — independent Poisson samples would not show
+   this kind of clustering.
+
+### Does the imposed trend actually appear?
+
+```{r inspect_trend, fig.width = 9, fig.height = 4}
+par(mfrow = c(1, 2))
+
+plot(locs[, "x"], values,
+     pch = 19, cex = 0.7, col = "gray40",
+     xlab = "x coordinate", ylab = "count",
+     main = "Count vs x")
+abline(lm(values ~ locs[, "x"]), col = "red", lwd = 2)
+
+plot(locs[, "y"], values,
+     pch = 19, cex = 0.7, col = "gray40",
+     xlab = "y coordinate", ylab = "count",
+     main = "Count vs y")
+abline(lm(values ~ locs[, "y"]), col = "red", lwd = 2)
+```
+
+Both slopes should be positive (the trend says so), and the $y$ slope should be steeper than the $x$ slope (since the coefficient on $y$ is twice that on $x$).
+
+### The "truth" table
+
+Since H18-B was simulated, we know the true parameters exactly. They live inside the scenario object for easy reference:
+
+```{r inspect_truth}
+s$true_params
+```
+
+When we later fit a model to this data with `mlegc()` in the analysis stage, the estimates should land close to these values. Estimates far from the truth would suggest either a bug or a genuinely hard inferential regime.
+
+### Comparison with gcKrig's own plotter
+
+`gcKrig` ships with a nice visualization for simulated data. We can
+reconstruct a `simgc`-class object from our stored scenario and pass
+it in:
+
+```{r inspect_gckrig_plot, fig.width = 7, fig.height = 6}
+library(gcKrig)
+
+# Rebuild a simgc-compatible object
+sim_like <- list(
+  data = s$values,   # n x sim_n matrix
+  locs = s$locations
+)
+class(sim_like) <- "simgc"
+
+plot(sim_like, index = 1, plottype = "Dot", col = 2)
+```
+
+This should reproduce (approximately) Figure 1 middle panel from Han's
+paper — the exact pattern differs because their example in that
+figure uses a different seed and different parameters, but the
+visual style is the same.

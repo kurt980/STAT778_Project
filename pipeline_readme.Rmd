@@ -1,0 +1,911 @@
+---
+title: "STAT778 Project Codebase Guide: Simulation, Fitting, and Results"
+author: "STAT778 Project"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 7,
+  fig.height = 5
+)
+```
+
+# Purpose of this document
+
+This document is a code-level guide to the current STAT778 project pipeline. It is written from the **coding standpoint first**, and it inserts theory only where the theory helps explain what the code is doing.
+
+The main goals are:
+
+1. Explain how simulation scenarios are defined.
+2. Explain how simulated data are generated.
+3. Explain how fitted models are run.
+4. Explain how outputs are stored and interpreted.
+5. Clarify what parameters and settings go into the code.
+6. Clarify the difference between **generation-scale truth** and **fitting-scale truth**.
+
+This document is meant to answer questions like:
+
+* What exactly is a scenario in this codebase?
+* What is the exact input to the simulation wrapper?
+* What is the exact input to the fitting wrapper?
+* What does the fitting wrapper return?
+* Why do fitted parameters sometimes appear on a different scale than the simulation truth?
+* What are the four scenario families and what role does each play?
+
+---
+
+# Repository structure
+
+At a high level, the repository is organized around:
+
+* a shared library under `code/R/`
+* per-dataset configs under `code/configs/`
+* per-dataset driver scripts under `code/scripts/`
+* Slurm submission scripts under `code/slurm/`
+* saved outputs under `data/generated/` and `data/fits/`
+
+A typical layout is:
+
+```text
+STAT778_Project/
+├── README.md
+├── h18b_example.Rmd
+├── code/
+│   ├── R/
+│   │   ├── logging.R
+│   │   ├── grids.R
+│   │   ├── spec_utils.R
+│   │   ├── sim_core.R
+│   │   ├── fit_core.R
+│   │   ├── io.R
+│   │   └── helper_functions.R
+│   ├── configs/
+│   │   ├── h18b.R
+│   │   ├── k13a.R
+│   │   ├── k13b.R
+│   │   └── k13c.R
+│   ├── scripts/
+│   │   ├── 01_gen_h18b.R
+│   │   ├── 02_gen_k13a.R
+│   │   ├── ...
+│   │   └── 10_fit_k13a.R
+│   └── slurm/
+│       ├── _env.sh
+│       ├── 01_gen_h18b.slurm
+│       ├── 02_gen_k13a.slurm
+│       └── 10_fit_k13a.slurm
+├── data/
+│   ├── generated/
+│   └── fits/
+├── logs/
+└── visualization/
+```
+
+The design principle is simple:
+
+* **configs** define what should exist,
+* **scripts** execute one pipeline stage,
+* **shared R files** contain reusable logic,
+* **saved objects** are the persistent interface between stages.
+
+---
+
+# The four scenario families
+
+The project currently works with four scenario families.
+
+## H18-B
+
+H18-B is the Han and De Oliveira (2018)-style warm-up scenario. It is mainly used to verify that the simulation and fitting environment works correctly inside `gcKrig`.
+
+Its role in the project is:
+
+* sanity check for installation and package setup,
+* first end-to-end pipeline test,
+* package-comparison warm-up.
+
+## K13-A
+
+K13-A is the main Kazianka (2013) estimation study scenario family. It is a Monte Carlo simulation design with repeated replicated datasets under one parameter cell.
+
+Its role in the project is:
+
+* the main baseline estimation study,
+* comparison of GHK and GQT,
+* the launch point for later misspecification and robustness extensions.
+
+## K13-B
+
+K13-B is the Poisson prediction-accuracy benchmark. It is not a large Monte Carlo design. Instead, it is a fixed benchmark geometry with fixed observed values and a parameter grid over which predictive distributions are compared.
+
+Its role in the project is:
+
+* isolating approximation error in predictive distributions,
+* comparing exact or benchmark prediction against approximate prediction.
+
+## K13-C
+
+K13-C is the Bernoulli analogue of K13-B. It uses fixed binary observation patterns on the same simple cross-shaped geometry.
+
+Its role in the project is:
+
+* stress-testing prediction in the highly discrete regime,
+* understanding where approximation becomes unstable.
+
+So there are “four scenario families,” but they are not all the same kind of object:
+
+* **H18-B and K13-A** are Monte Carlo simulation scenarios.
+* **K13-B and K13-C** are fixed benchmark scenarios for prediction.
+
+---
+
+# Shared design idea: the scenario object
+
+A central idea in this codebase is that each dataset is represented by a **scenario object**.
+
+A scenario object is a standard list that stores:
+
+* identifiers (`dataset_id`, `scenario_id`)
+* the full generating config
+* spatial locations
+* simulated values or fixed observed values
+* true generating parameters
+* provenance fields such as seed, package version, and creation time
+
+This means the project always tries to save **self-describing objects**. Once a scenario has been saved to disk, it should be possible to load it and know:
+
+* where it came from,
+* what parameters generated it,
+* how many replicates it contains,
+* what the fitting code should do with it.
+
+---
+
+# Shared design idea: the fit-result object
+
+Fitting does not overwrite scenario objects. Instead, fitting produces a separate **fit-result object**.
+
+A fit-result object stores:
+
+* identifiers (`dataset_id`, `scenario_id`)
+* the scenario config that was fit
+* a long-format results table
+* provenance fields such as time and package version
+
+This keeps generation and fitting cleanly separated:
+
+* scenario objects represent **inputs to fitting**
+* fit-result objects represent **outputs from fitting**
+
+---
+
+# The full code pipeline in one sentence
+
+The full pipeline is:
+
+1. a config file defines one or more scenarios,
+2. a script generates and saves scenario objects,
+3. another script fits those scenario objects and saves fit-result objects,
+4. an RMarkdown analysis file loads those saved objects and produces summaries, plots, and interpretations.
+
+---
+
+# Load the shared pipeline
+
+```{r load_pipeline}
+suppressPackageStartupMessages({
+  library(gcKrig)
+})
+
+source("code/R/logging.R")
+source("code/R/grids.R")
+source("code/R/spec_utils.R")
+source("code/R/sim_core.R")
+source("code/R/fit_core.R")
+source("code/R/io.R")
+```
+
+Optionally load any configs that exist locally:
+
+```{r load_configs}
+if (file.exists("code/configs/h18b.R")) source("code/configs/h18b.R")
+if (file.exists("code/configs/k13a.R")) source("code/configs/k13a.R")
+if (file.exists("code/configs/k13b.R")) source("code/configs/k13b.R")
+if (file.exists("code/configs/k13c.R")) source("code/configs/k13c.R")
+```
+
+---
+
+# Part I: Simulation pipeline
+
+# 1. What is the exact input to the simulation wrapper?
+
+For Monte Carlo simulation scenarios like H18-B and K13-A, the simulation wrapper receives five main inputs:
+
+1. `spec`
+   A nested list containing identifiers, layout, marginal spec, correlation spec, seed, replicate count, and metadata.
+
+2. `locations`
+   A numeric matrix of coordinates, usually `n x 2`.
+
+3. `marginal`
+   A `marginal.gc` object from `gcKrig`, such as:
+
+   * `poisson.gc(lambda = 5)`
+   * `negbin.gc(mu = ..., od = 1)`
+
+4. `corr`
+   A `corr.gc` object from `gcKrig`, such as:
+
+   * `matern.gc(range = 0.3, kappa = 0.5, nugget = 0)`
+
+5. `true_params`
+   A flat named list used only for bookkeeping and later comparison.
+
+Then the simulation wrapper calls `gcKrig::simgc()` and standardizes the output into the project schema.
+
+---
+
+# 2. Where do the scenario specs come from?
+
+They come from config files under `code/configs/`.
+
+For example, the current K13-A pilot should be defined in `code/configs/k13a.R`. If that config exists, you can inspect it directly.
+
+```{r inspect_k13a_spec, eval = exists("K13A_SCENARIOS")}
+if (exists("K13A_SCENARIOS")) {
+  names(K13A_SCENARIOS)
+  str(K13A_SCENARIOS$default, max.level = 3)
+}
+```
+
+The important point is:
+
+> The config is a declarative recipe. It says what the scenario should be, but it does not itself generate any data.
+
+---
+
+# 3. How locations are generated
+
+The file `code/R/grids.R` is responsible for constructing the spatial layout.
+
+For K13-A, the default pilot uses a regular grid. The config says “regular grid with side length 7,” and the code turns that into a `49 x 2` location matrix.
+
+```{r build_locations, eval = exists("K13A_SCENARIOS")}
+if (exists("K13A_SCENARIOS")) {
+  spec <- K13A_SCENARIOS$default
+  locs <- do.call(make_locations, spec$layout)
+
+  dim(locs)
+  head(locs)
+  tail(locs)
+}
+```
+
+For a regular grid, the row order matters because later:
+
+* rows of `locations`,
+* rows of `values`
+
+must correspond exactly.
+
+---
+
+# 4. Theory behind the simulation
+
+The simulations are based on **Gaussian copula spatial models**.
+
+At the theory level, the construction is:
+
+1. Generate a latent Gaussian random field
+   $$
+   Z = (Z(s_1), \dots, Z(s_n))
+   $$
+   over the chosen locations, with mean zero, unit variance, and a spatial correlation matrix determined by the chosen correlation model.
+
+2. Convert the latent Gaussian values to uniforms:
+   $$
+   U_i = \Phi(Z(s_i)).
+   $$
+
+3. Convert uniforms to the target marginal distribution:
+   $$
+   Y(s_i) = F^{-1}(U_i).
+   $$
+
+This gives discrete spatial data whose:
+
+* marginal distribution is controlled by $F$,
+* dependence structure is controlled by the latent Gaussian field.
+
+This is the core idea used in both Kazianka (2013) and gcKrig.
+
+---
+
+# 5. K13-A default: exact simulation setup
+
+For the current default pilot, the setup is:
+
+* $n = 49$ locations on a $7 \times 7$ regular grid,
+* `sim_n = 30` independent Monte Carlo replicates,
+* marginal family: Poisson,
+* marginal mean: $\lambda = 5$,
+* correlation family: Matérn,
+* range: $0.3$,
+* smoothness: $\kappa = 0.5$,
+* nugget: $0$.
+
+Because $\kappa = 0.5$, the Matérn correlation reduces to the exponential model:
+$$
+\rho(h) = \exp(-h / r),
+$$
+with $r = 0.3$.
+
+So each replicate is a length-49 vector of correlated Poisson counts.
+
+---
+
+# 6. What `simulate_mc_scenario()` returns
+
+The simulation wrapper returns a **scenario object** created by `make_scenario()`.
+
+Let us load the generated default K13-A object if it exists.
+
+```{r load_generated_scenario, eval = file.exists("data/generated/K13-A/default.rds")}
+if (file.exists("data/generated/K13-A/default.rds")) {
+  scenario <- load_scenario("K13-A", "default")
+  str(scenario, max.level = 1)
+}
+```
+
+The most important fields are:
+
+* `scenario$locations`: the `n x 2` coordinate matrix,
+* `scenario$values`: the `n x B` count matrix,
+* `scenario$true_params`: generation truth,
+* `scenario$config`: the original spec.
+
+```{r inspect_generated_values, eval = exists("scenario")}
+if (exists("scenario")) {
+  dim(scenario$locations)
+  dim(scenario$values)
+  scenario$true_params
+  scenario$seed_info
+}
+```
+
+Interpretation of `values`:
+
+* each **row** corresponds to one spatial location,
+* each **column** corresponds to one Monte Carlo replicate.
+
+So:
+
+```{r replicate_vector, eval = exists("scenario")}
+if (exists("scenario")) {
+  y1 <- scenario$values[, 1]
+  length(y1)
+  head(y1)
+}
+```
+
+is the full first dataset to be fit.
+
+---
+
+# 7. Quick visualization of one simulated replicate
+
+```{r plot_one_replicate, eval = exists("scenario")}
+if (exists("scenario")) {
+  rep_i <- 1
+  values_i <- scenario$values[, rep_i]
+
+  plot(
+    scenario$locations[, "x"],
+    scenario$locations[, "y"],
+    pch = 19,
+    cex = 0.5 + 2 * values_i / max(values_i),
+    col = hcl.colors(50, "YlOrRd", rev = TRUE)[
+      cut(values_i, breaks = 50, labels = FALSE)
+    ],
+    xlab = "x", ylab = "y",
+    main = sprintf("K13-A default, replicate %d", rep_i)
+  )
+}
+```
+
+This is often the fastest way to check that:
+
+* the scenario loaded correctly,
+* the values are not degenerate,
+* there is visible spatial structure.
+
+---
+
+# 8. What do the “true parameters” mean?
+
+The `true_params` field stores the **generation-scale truth**, not necessarily the fitting-scale truth.
+
+For the current K13-A pilot, it stores things like:
+
+* `lambda = 5`
+* `range = 0.3`
+* `kappa = 0.5`
+* `nugget = 0`
+
+These are the parameters that generated the data.
+
+```{r show_true_params, eval = exists("scenario")}
+if (exists("scenario")) {
+  scenario$true_params
+}
+```
+
+But the fitting code does **not** necessarily estimate all of these directly.
+
+That is a major source of confusion, so the next section explains it carefully.
+
+---
+
+# Part II: Fitting pipeline
+
+# 9. The key idea of fitting
+
+The fitting wrapper does **not** fit the scenario object as one big dataset.
+
+Instead, it works **one replicate at a time**.
+
+If the scenario contains a `49 x 30` matrix, then there are 30 separate datasets inside it, and each one must be fit separately.
+
+The fitting wrapper automates that process.
+
+---
+
+# 10. The three main layers in `fit_core.R`
+
+The file `code/R/fit_core.R` has three important levels.
+
+## Layer 1: `.fit_one()`
+
+This fits **one replicate** with **one method**.
+
+Inputs:
+
+* one scenario object,
+* one replicate index,
+* one fitting method (`"GHK"` or `"GQT"`).
+
+Output:
+
+* one one-row data frame containing fit metadata and results.
+
+## Layer 2: `fit_scenario()`
+
+This loops over all requested replicates and methods.
+
+For example, if there are 30 replicates and 2 methods, it produces:
+$$
+30 \times 2 = 60
+$$
+rows of results.
+
+## Layer 3: `make_fit_result()`
+
+This packages the final output into a standard fit-result object.
+
+So the fitting pipeline is:
+
+* **input:** one scenario object,
+* **work:** fit every requested replicate by every requested method,
+* **output:** one fit-result object with a long-format results table.
+
+---
+
+# 11. What is the exact input to `.fit_one()`?
+
+For one replicate, `.fit_one()` extracts:
+
+```r
+y    <- scenario$values[, replicate]
+locs <- scenario$locations
+spec <- scenario$config
+```
+
+So the real data passed to `mlegc()` are:
+
+* one count vector `y`,
+* one location matrix `locs`.
+
+Then it rebuilds the gcKrig objects **for fitting**, not for simulation.
+
+This distinction matters.
+
+---
+
+# 12. Why fitting objects differ from simulation objects
+
+For simulation, the marginal and correlation objects were built with the true parameters filled in.
+
+For example:
+
+* `poisson.gc(lambda = 5)`
+* `matern.gc(range = 0.3, kappa = 0.5, nugget = 0)`
+
+For fitting, the model must be told **what family to assume**, but the parameters to be estimated should be **left unset**.
+
+So the fitting builder does things like:
+
+* `poisson.gc()`
+* `negbin.gc()`
+* `binomial.gc(size = 1)`
+* `matern.gc(kappa = ..., nugget = ...)`
+
+This tells `mlegc()` what type of model to fit.
+
+---
+
+# 13. What gets estimated in the default K13-A fit?
+
+This is a critical point.
+
+The generation truth stores:
+
+* `lambda = 5`
+* `range = 0.3`
+* `kappa = 0.5`
+* `nugget = 0`
+
+But the fitting code does **not** estimate all four.
+
+For the default pilot:
+
+* the Poisson marginal parameter is estimated,
+* the range is estimated,
+* `kappa` is held fixed at `0.5`,
+* nugget is fixed at zero and not estimated.
+
+So the fit is estimating a **smaller parameter set** than the full simulation truth.
+
+This is by design.
+
+---
+
+# 14. Why the fitted Poisson parameter appears as 1.6 instead of 5
+
+gcKrig fits the Poisson mean using a **log link**.
+
+That means the fitted marginal parameter is not $\lambda$ directly. It is the intercept:
+$$
+\beta_0 = \log(\lambda).
+$$
+
+For the default truth $\lambda = 5$:
+$$
+\beta_0^{\text{true}} = \log(5) \approx 1.609.
+$$
+
+So:
+
+* generation-scale truth: `lambda = 5`,
+* fitting-scale truth: `Intercept = log(5) ≈ 1.609`.
+
+That is why boxplots may show a truth line near `1.6`.
+
+Both refer to the same underlying truth, just on different scales.
+
+---
+
+# 15. Smoke test: fit one replicate with both methods
+
+The easiest way to understand the wrapper is to use it on one replicate.
+
+```{r smoke_fit, eval = exists("scenario")}
+if (exists("scenario")) {
+  smoke_result <- fit_scenario(
+    scenario   = scenario,
+    methods    = c("GHK", "GQT"),
+    replicates = 1
+  )
+
+  str(smoke_result, max.level = 1)
+  smoke_result$results
+}
+```
+
+This asks the wrapper to do only:
+
+* replicate 1 with GHK,
+* replicate 1 with GQT.
+
+So the results table should have exactly 2 rows.
+
+---
+
+# 16. What the fit-result object contains
+
+The output of `fit_scenario()` is a fit-result object with:
+
+* `dataset_id`
+* `scenario_id`
+* `scenario_config`
+* `results`
+* provenance fields like creation time and package version
+
+The key component is `fit_result$results`.
+
+```{r inspect_fit_result, eval = exists("smoke_result")}
+if (exists("smoke_result")) {
+  res <- smoke_result$results
+  names(res)
+  res
+}
+```
+
+Typical columns are:
+
+* `replicate`
+* `method`
+* `converged`
+* `error_message`
+* `runtime_sec`
+* `loglik`
+* `aic`
+* `bic`
+* `aicc`
+* `estimates`
+* `std_errors`
+
+The last two are list-columns. Each row has its own estimate list and standard-error list.
+
+---
+
+# 17. Looking inside one fitted row
+
+```{r inspect_one_fit_row, eval = exists("smoke_result")}
+if (exists("smoke_result")) {
+  res <- smoke_result$results
+  res$estimates[[1]]
+  res$std_errors[[1]]
+}
+```
+
+This is usually where you see parameter names such as:
+
+* `Intercept`
+* `range`
+
+Those are the fitted parameter names returned by gcKrig.
+
+For the current pilot, the correct truth comparisons are:
+
+* `Intercept` versus `log(5)`,
+* `range` versus `0.3`.
+
+---
+
+# 18. What “converged” means in this codebase
+
+In the wrapper, `converged = TRUE` means:
+
+* `mlegc()` returned without throwing an error.
+
+`converged = FALSE` means:
+
+* the fit failed,
+* the wrapper caught the error,
+* the error message was stored instead of stopping the whole scenario.
+
+This is one of the main reasons to have the wrapper at all. In a large simulation study, one bad replicate should not crash the whole run.
+
+---
+
+# Part III: Results and evaluation
+
+# 19. What is evaluated from the fit results?
+
+The project currently evaluates methods through summaries of the `results` table.
+
+The main quantities are:
+
+* convergence rate by method,
+* runtime by method,
+* distributions of fitted parameters,
+* mean absolute error (MAE) versus truth.
+
+---
+
+# 20. Convergence summary
+
+```{r convergence_summary, eval = exists("smoke_result")}
+if (exists("smoke_result")) {
+  res <- smoke_result$results
+  tab <- table(method = res$method, converged = res$converged)
+  tab
+  prop.table(tab, margin = 1)
+}
+```
+
+For the smoke test this is not very informative, but for the full 30-replicate fit it becomes meaningful.
+
+---
+
+# 21. Runtime summary
+
+```{r runtime_summary, eval = exists("smoke_result")}
+if (exists("smoke_result")) {
+  res <- smoke_result$results
+  aggregate(runtime_sec ~ method, data = res, mean)
+}
+```
+
+For the full fit-result object this tells you how much slower GHK is than GQT.
+
+---
+
+# 22. Estimate extraction and truth comparison
+
+For full evaluation, the `estimates` list-column is unpacked into long format.
+
+The logic is:
+
+1. for each row of the results table,
+2. take the named estimate list,
+3. make one row per parameter,
+4. attach the truth value,
+5. compute error summaries such as MAE.
+
+The crucial subtlety is that truth must be compared on the **correct scale**:
+
+* `Intercept` should be compared to `log(lambda)`,
+* `range` should be compared to the stored true range.
+
+---
+
+# 23. Full fit object on disk
+
+Once a full fit is run and saved, you can reload it with:
+
+```{r load_saved_fit, eval = FALSE}
+fit_result <- load_fit_result("K13-A", "default")
+str(fit_result, max.level = 1)
+dim(fit_result$results)
+```
+
+If all 30 replicates are fit by both methods, then:
+
+* `fit_result$results` should have 60 rows.
+
+---
+
+# Part IV: How to think about the whole pipeline
+
+# 24. End-to-end summary
+
+The codebase pipeline is:
+
+## Step 1: config
+
+A config file defines a scenario spec.
+
+## Step 2: generate
+
+A generation script:
+
+* builds locations,
+* builds gcKrig simulation objects,
+* calls `simulate_mc_scenario()`,
+* saves a scenario object.
+
+## Step 3: fit
+
+A fitting script:
+
+* loads a scenario object,
+* calls `fit_scenario()`,
+* saves a fit-result object.
+
+## Step 4: analyze
+
+An RMarkdown or analysis script:
+
+* loads scenario and fit-result objects,
+* summarizes convergence, timing, estimates, and errors,
+* produces tables and plots.
+
+So the project is really built around two persistent object types:
+
+* **scenario objects**
+* **fit-result objects**
+
+---
+
+# 25. Practical inspection checklist
+
+When something feels confusing, these are the most useful object-level checks.
+
+## For a scenario object
+
+```{r scenario_checklist, eval = exists("scenario")}
+if (exists("scenario")) {
+  dim(scenario$locations)
+  dim(scenario$values)
+  scenario$true_params
+  head(scenario$values[, 1])
+}
+```
+
+## For a fit-result object
+
+```{r fit_checklist, eval = exists("smoke_result")}
+if (exists("smoke_result")) {
+  smoke_result$dataset_id
+  smoke_result$scenario_id
+  dim(smoke_result$results)
+  smoke_result$results[, c("replicate", "method", "converged", "runtime_sec")]
+  smoke_result$results$estimates[[1]]
+}
+```
+
+These usually tell you:
+
+* what went in,
+* what came out,
+* what scale the parameters are on.
+
+---
+
+# 26. Recommended workflow
+
+The intended workflow is:
+
+1. **Use RMarkdown interactively** for:
+
+   * small-scale inspection,
+   * smoke-test fitting,
+   * checking object structures,
+   * developing plots and summaries.
+
+2. **Use Slurm** for:
+
+   * large replicate counts,
+   * many scenario cells,
+   * full fitting runs.
+
+3. **Return to RMarkdown** to:
+
+   * read saved results,
+   * compute MAEs,
+   * make report figures,
+   * write interpretation.
+
+This separation keeps debugging fast and production runs reproducible.
+
+---
+
+# 27. Final takeaway
+
+From a coding standpoint, the project has a very simple architecture once the wrappers are understood:
+
+* the **simulation wrapper** turns a config plus gcKrig objects into a saved scenario object,
+* the **fitting wrapper** turns a scenario object into a saved fit-result object,
+* the **analysis layer** reads those saved objects and computes summaries.
+
+The theory only enters at a few places:
+
+* latent Gaussian copula construction for simulation,
+* Matérn or exponential spatial correlation,
+* log-link parameterization for Poisson fitting.
+
+Everything else is bookkeeping, looping, and schema management.
+
+---

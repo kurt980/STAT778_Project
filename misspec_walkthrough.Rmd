@@ -1,0 +1,25 @@
+---
+title: "misspec_walkthrough"
+author: "Kurt"
+date: "4/22/2026"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+```{r}
+setwd("/scratch/cji4/STAT778_Project")
+# Generate
+source("code/scripts/03_gen_misspec.R")
+# Smoke-test the 2x2 fit with 2 replicates only, before committing to 30
+source("code/R/logging.R"); source("code/R/io.R"); source("code/R/fit_core.R")
+scenario <- load_scenario("MISSPEC", "pois_pilot")
+smoke <- fit_scenario(scenario, replicates = 1:2,
+                     fit_marginal_spec = list(family = "negbin"))
+smoke$misspecified  # should be TRUE
+smoke$results
+```

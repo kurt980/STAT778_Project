@@ -1,0 +1,633 @@
+---
+title: "STAT778 Project: Codebase Walkthrough"
+author: "STAT778 Project"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  message = TRUE,
+  warning = FALSE,
+  fig.width = 7,
+  fig.height = 5
+)
+```
+
+## Purpose of this document
+
+A tour of the codebase. Three goals:
+
+1. Explain the two-level naming system (`dataset_id` vs `scenario_id`)
+   and how to manage many datasets.
+2. Document every field in the saved scenario object.
+3. Describe each file in `code/` and what it contributes.
+
+---
+
+## Part 1: Dataset families and scenarios
+
+### The two identifiers
+
+Every simulation in this project carries two labels:
+
+- **`dataset_id`** — the *family*. Identifies which paper / section a
+  simulation recipe comes from. Examples: `"H18-B"` (Han and De Oliveira
+  2018, Section 4.4), `"K13-A"` (Kazianka 2013, main estimation study).
+- **`scenario_id`** — the specific *instance* within that family.
+  The paper target is always named `"default"`. Variants have
+  descriptive names like `"range_0.5"` or `"od_2"`.
+
+On disk, each saved simulation becomes one file:
+
+```
+data/generated/<dataset_id>/<scenario_id>.rds
+```
+
+So a typical layout, once we have variants:
+
+```
+data/generated/
+└── H18-B/
+    ├── default.rds
+    ├── range_0.5.rds
+    ├── range_0.7.rds
+    └── od_2.rds
+```
+
+All four files are "H18-B datasets". They share the same family recipe
+but differ in specific parameter values.
+
+### Listing what's on disk
+
+```{r list_scenarios}
+source("code/R/logging.R")
+source("code/R/io.R")
+
+available <- list_scenarios("H18-B")
+available
+```
+
+### Loading a specific scenario
+
+```{r load_one}
+s <- load_scenario("H18-B", "default")
+```
+
+### Loading all scenarios for a family
+
+```{r load_all, eval = FALSE}
+all_h18b <- lapply(list_scenarios("H18-B"), function(id) {
+  load_scenario("H18-B", id)
+})
+names(all_h18b) <- list_scenarios("H18-B")
+```
+
+### Generating multiple scenarios in one run
+
+The paper target lives in `H18B_SCENARIOS$default` and should stay
+untouched. To add variants, either edit `code/configs/h18b.R` (for
+permanent additions) or append to the list at the R prompt (for
+one-offs):
+
+```{r append_variants, eval = FALSE}
+source("code/R/spec_utils.R")
+source("code/configs/h18b.R")
+
+for (r in c(0.1, 0.5, 0.7)) {
+  id <- sprintf("range_%g", r)
+  H18B_SCENARIOS[[id]] <- h18b_spec(id, list(corr = list(range = r)))
+}
+
+# Then re-run the generation script; it picks up every entry in
+# H18B_SCENARIOS and saves one .rds per scenario.
+source("code/scripts/01_gen_h18b.R")
+```
+
+---
+
+## Part 2: What's inside a saved scenario
+
+A loaded scenario is a list with 14 fields. Here's each one.
+
+```{r show_structure}
+str(s, max.level = 1)
+```
+
+### Identity
+
+```{r field_id}
+s$dataset_id
+s$scenario_id
+```
+
+Convenience duplicates of `s$config$dataset_id` and
+`s$config$scenario_id`, pulled out to the top level so generic code
+can find them without descending into `$config`.
+
+### `config` — the full input spec, verbatim
+
+This is the most important field for reproducibility. It is the exact
+list that was passed to the simulator. Whatever you put in the config
+comes back out here — nothing is dropped, nothing is transformed.
+
+```{r field_config}
+str(s$config, max.level = 2)
+```
+
+Fields inside `config`:
+
+- `dataset_id`, `scenario_id`, `scenario_type` — identity.
+- `layout` — how locations were constructed (grid size, bounds).
+- `marginal` — the response distribution family and its parameters.
+- `corr` — the spatial correlation family and its parameters.
+- `sim_n` — number of independent realizations.
+- `seed` — the RNG seed used.
+
+Because the full config is stored, you can always reconstruct exactly
+how a scenario was generated, no matter how the pipeline evolves later.
+
+### `locations` — the spatial grid
+
+An $n \times 2$ numeric matrix with columns `x` and `y`.
+
+```{r field_locations}
+dim(s$locations)
+head(s$locations)
+```
+
+### `values` — the simulated observations
+
+An $n \times B$ numeric matrix, where $B = $ `sim_n`. For H18-B,
+`sim_n = 1`, so `values` has one column.
+
+```{r field_values}
+dim(s$values)
+head(s$values)
+```
+
+If `sim_n > 1`, each column is an independent replicate:
+
+```r
+s$values[, 1]   # first replicate
+s$values[, 42]  # 42nd replicate
+```
+
+### `values_full` — always NULL at generation time
+
+Reserved for future extensions. If a missingness or contamination step is applied later, the pre-modification values go here; `values` then holds the post-modification data.
+
+```{r field_values_full}
+s$values_full
+```
+
+### `true_params` — generating parameters in flat form
+
+A flat named list for direct comparison against estimated parameters later. Redundant with what's in `$config`, but conveniently flat.
+
+```{r field_true_params}
+s$true_params
+```
+
+When we fit `mlegc()` to this data in the analysis stage, the
+estimates should land close to these values.
+
+### Provenance: `created_at`, `r_version`, `gcKrig_version`
+
+Records when and with what software this scenario was generated. Reproducibility insurance: if you rerun a year from now with a different `gcKrig` version and get different numbers, these tell you why.
+
+```{r field_provenance}
+s$created_at
+s$r_version
+s$gcKrig_version
+```
+
+### `seed_info` — how the RNG was handled
+
+```{r field_seed_info}
+s$seed_info
+```
+
+- `scheme = "direct"` — the seed was applied via `set.seed()` right before `simgc()` was called.
+- `scheme = "fixed"` — used by K13-B/C where observations are prescribed, not drawn (no RNG involved).
+
+### `coord_transform_applied`
+
+```{r field_coord_transform}
+s$coord_transform_applied
+```
+
+`FALSE` for all current scenarios. Reserved for future anisotropy extensions where coordinates are transformed before simulation.
+
+### `missingness_spec`, `contamination_spec`
+
+```{r field_extensions}
+s$missingness_spec
+s$contamination_spec
+```
+
+NULL placeholders for planned extensions (informative missingness, outlier contamination). Kept in the schema now so the object layout stays stable when those features arrive.
+
+---
+
+## Part 3: What each file in `code/` does
+
+### `code/R/` — shared library (dataset-agnostic)
+
+These five files contain all the reusable machinery. They know nothing about any specific dataset.
+
+#### `code/R/logging.R`
+
+Provides timestamped, leveled log messages used throughout the pipeline.
+
+- `log_info(fmt, ...)` — normal progress messages.
+- `log_warn(fmt, ...)` — warnings, always shown.
+- `log_debug(fmt, ...)` — diagnostic messages, suppressed unless
+  `options(sim_pipeline.debug = TRUE)`.
+- `log_rule(label)` — horizontal separator for readability.
+
+#### `code/R/grids.R`
+
+Builds spatial location matrices.
+
+- `make_locations(layout_type, ...)` — single entry point. Currently
+  only `layout_type = "regular_grid"` is implemented. Later extensions
+  will add `"clustered"`, `"sparse"`, `"transect"`, etc. as new
+  branches.
+
+#### `code/R/spec_utils.R`
+
+- `merge_spec(base, overrides)` — recursive list merge. Lets you
+  override one leaf of a nested list without restating the rest.
+  This is what makes `h18b_spec("range_0.5", list(corr = list(range = 0.5)))`
+  work: only `corr$range` changes; `corr$kappa`, `corr$nugget`,
+  and everything outside `corr` inherit from the paper target.
+
+#### `code/R/sim_core.R`
+
+The heart of the pipeline. Three public functions.
+
+- `make_scenario(config, locations, values, ...)` — scenario object
+  factory. Defines the 14-field schema. All other generators funnel
+  through this so the schema lives in exactly one place.
+- `simulate_mc_scenario(spec, locations, marginal, corr, ...)` —
+  wraps `gcKrig::simgc()`. Handles seeding, shape normalization,
+  and logging. Returns a scenario object.
+- `build_fixed_scenario(spec, locations, ...)` — for K13-B/C, where
+  observations are prescribed rather than simulated. Returns the same
+  scenario object type.
+
+The statistics are entirely delegated to `gcKrig::simgc()`. This file
+does not implement simulation; it only wraps it in reproducibility
+scaffolding.
+
+#### `code/R/io.R`
+
+Persistence.
+
+- `save_scenario(scenario, dir)` — writes `scenario` to
+  `<dir>/<dataset_id>/<scenario_id>.rds`.
+- `load_scenario(dataset_id, scenario_id, dir)` — reads back the
+  file at that path. Equivalent to
+  `readRDS(file.path(dir, dataset_id, paste0(scenario_id, ".rds")))`.
+- `list_scenarios(dataset_id, dir)` — lists scenario ids currently
+  saved under a given family.
+
+### `code/configs/` — per-dataset configurations
+
+One file per dataset family.
+
+#### `code/configs/h18b.R`
+
+- `h18b_spec(scenario_id, overrides)` — builder. Called with no
+  arguments, returns the paper target. Called with overrides, returns
+  a variant.
+- `H18B_SCENARIOS` — named list of specs to generate. Keyed by
+  `scenario_id`. Starts with just `default` (the paper target);
+  variants can be appended.
+
+Every dataset family will have an analogous file (`k13a.R`, etc.) with
+its own builder and scenarios list. Convention: the builder is named
+`<dataset>_spec()` and the list is `<DATASET>_SCENARIOS`.
+
+### `code/scripts/` — generation scripts
+
+One script per dataset family. Each is a standalone R script that:
+
+1. Sources the shared library.
+2. Sources its dataset's config.
+3. Iterates over the scenarios list and calls the appropriate
+   simulator for each.
+
+#### `code/scripts/01_gen_h18b.R`
+
+- Resolves the project root (via `$GCKRIG_PROJECT_ROOT`,
+  `$SLURM_SUBMIT_DIR`, or `getwd()` in that priority order).
+- Sources all needed library files.
+- Accepts optional command-line arguments to filter which scenarios
+  to generate:
+
+```bash
+Rscript code/scripts/01_gen_h18b.R                       # all scenarios
+Rscript code/scripts/01_gen_h18b.R default               # only one
+Rscript code/scripts/01_gen_h18b.R default range_0.5     # two
+```
+
+- Contains three small helpers — `build_marginal()`, `build_corr()`,
+  `extract_true_params()` — that translate spec lists into `gcKrig` S3
+  objects. These are local to the script for now because they may need
+  family-specific branches as new datasets are added; if they end up
+  shared across all scripts, they'll be promoted to `code/R/`.
+
+### `code/slurm/` — batch submission
+
+#### `code/slurm/_env.sh`
+
+Shared environment setup. Sourced by every `.slurm` script. This is
+where R module loads go — you should have edited it during initial
+setup to point at your Hopper R module.
+
+#### `code/slurm/01_gen_h18b.slurm`
+
+`sbatch` submission script for H18-B. Requests 1 CPU, 4 GB RAM, 30
+minutes. Calls `Rscript code/scripts/01_gen_h18b.R`. Supports optional
+scenario filtering via an environment variable:
+
+```bash
+sbatch code/slurm/01_gen_h18b.slurm                                        # all
+sbatch --export=ALL,SCENARIO_IDS="default range_0.5" code/slurm/01_gen_h18b.slurm
+```
+
+---
+
+## Part 4: End-to-end example
+
+Putting all the pieces together: generate the paper target, load it
+back, and verify the round trip works.
+
+### Generate
+
+```{r demo_generate}
+source("code/scripts/01_gen_h18b.R")
+```
+
+### List what's now on disk
+
+```{r demo_list}
+list_scenarios("H18-B")
+```
+
+### Load and inspect
+
+```{r demo_load}
+s <- load_scenario("H18-B", "default")
+```
+
+### Confirm reproducibility
+
+The saved config should reconstruct the paper target exactly:
+
+```{r demo_roundtrip}
+source("code/R/spec_utils.R")
+source("code/configs/h18b.R")
+
+paper_target <- h18b_spec("default")
+
+identical(s$config, paper_target)
+```
+
+`TRUE` means the round trip is clean — no silent drops, no silent
+transformations.
+
+### Summary of the data
+
+```{r demo_summary}
+values <- s$values[, 1]
+
+cat("n locations:", nrow(s$locations), "\n")
+cat("n values:   ", length(values), "\n")
+cat("range:      [", min(values), ",", max(values), "]\n")
+cat("mean:       ", round(mean(values), 2), "\n")
+cat("zeros:      ", sum(values == 0), "\n")
+```
+
+---
+
+## Adding new datasets later
+
+When we implement K13-A, K13-B, K13-C, the pattern will be the same.
+For each new family, create:
+
+1. `code/configs/<name>.R` — builder `<name>_spec()` + `<NAME>_SCENARIOS`.
+2. `code/scripts/<NN>_gen_<name>.R` — load library, iterate scenarios, save.
+3. `code/slurm/<NN>_gen_<name>.slurm` — submission script.
+
+Nothing in `code/R/` needs to change. The `build_marginal()` and
+`build_corr()` helpers inside each script will grow a new branch when
+a new marginal or correlation family is needed, but the core library
+stays dataset-agnostic.
+
+
+---
+
+
+---
+
+## Visualizing a scenario
+
+```{r viz_setup}
+source("code/R/logging.R")
+source("code/R/io.R")
+source("code/R/helper_functions.R")
+library(gcKrig)
+
+s      <- load_scenario("H18-B", "default")
+values <- s$values[, 1]
+locs   <- s$locations
+```
+
+### Set up output folder
+
+```{r viz_save_setup}
+viz_dir <- "visualization/example"
+```
+
+### Option 1: gcKrig's built-in plotter
+
+```{r viz_gckrig, fig.width = 7, fig.height = 6}
+sim_like <- list(
+  data = s$values[, 1],
+  locs = s$locations
+)
+class(sim_like) <- "simgc"
+
+plot(sim_like, index = 1, plottype = "Text", col = 2)
+plot(sim_like, index = 1, plottype = "Dot",  col = 2)
+plot(sim_like, index = 1, plottype = "3D",   col = 2)
+
+save_base_plot(
+  quote(plot(sim_like, index = 1, plottype = "Text", col = 2)),
+  "01_gckrig_text"
+)
+save_base_plot(
+  quote(plot(sim_like, index = 1, plottype = "Dot", col = 2)),
+  "01_gckrig_dot"
+)
+save_base_plot(
+  quote(plot(sim_like, index = 1, plottype = "3D", col = 2)),
+  "01_gckrig_3d"
+)
+```
+
+### Option 2: Data in matrix form
+
+```{r viz_df}
+df <- data.frame(
+  x     = locs[, "x"],
+  y     = locs[, "y"],
+  count = values
+)
+
+head(df)
+
+write.csv(df, file.path(viz_dir, "02_data_long.csv"), row.names = FALSE)
+message("Saved: ", file.path(viz_dir, "02_data_long.csv"))
+```
+
+```{r viz_matrix}
+count_mat <- matrix(values, nrow = 11, ncol = 11, byrow = FALSE)
+
+count_mat
+
+write.csv(count_mat, file.path(viz_dir, "02_data_matrix.csv"), row.names = FALSE)
+message("Saved: ", file.path(viz_dir, "02_data_matrix.csv"))
+```
+
+### Option 3: Base R image / contour
+
+```{r viz_image, fig.width = 7, fig.height = 6}
+x_seq <- sort(unique(locs[, "x"]))
+y_seq <- sort(unique(locs[, "y"]))
+
+draw_image <- function() {
+  image(
+    x = x_seq, y = y_seq, z = count_mat,
+    col  = hcl.colors(20, "YlOrRd", rev = TRUE),
+    main = "H18-B simulated counts",
+    xlab = "x", ylab = "y"
+  )
+  contour(x_seq, y_seq, count_mat, add = TRUE, col = "gray30")
+  text(locs[, "x"], locs[, "y"], labels = values, cex = 0.6)
+}
+
+draw_image()
+
+save_base_plot(quote(draw_image()), "03_image_contour")
+```
+
+### Option 4: ggplot2
+
+```{r viz_ggplot, fig.width = 7, fig.height = 6}
+if (requireNamespace("ggplot2", quietly = TRUE)) {
+  library(ggplot2)
+
+  p <- ggplot(df, aes(x = x, y = y, fill = count)) +
+    geom_tile() +
+    geom_text(aes(label = count), size = 3, color = "white") +
+    scale_fill_viridis_c(option = "plasma") +
+    coord_equal() +
+    labs(title = "H18-B simulated counts",
+         x = "x coordinate", y = "y coordinate") +
+    theme_minimal()
+
+  print(p)
+
+  ggsave(file.path(viz_dir, "04_ggplot.png"), p,
+         width = 7, height = 6, dpi = 150)
+  ggsave(file.path(viz_dir, "04_ggplot.pdf"), p,
+         width = 7, height = 6)
+  message("Saved: ", file.path(viz_dir, "04_ggplot.{png,pdf}"))
+} else {
+  message("Install ggplot2 with install.packages('ggplot2') to use this.")
+}
+```
+
+### Option 5: Comparing scenarios side by side
+
+```{r viz_compare, fig.width = 12, fig.height = 5}
+ids <- list_scenarios("H18-B")
+
+if (length(ids) >= 2) {
+  draw_compare <- function() {
+    par(mfrow = c(1, length(ids)))
+    on.exit(par(mfrow = c(1, 1)), add = TRUE)
+    for (id in ids) {
+      sc <- load_scenario("H18-B", id)
+      v  <- sc$values[, 1]
+      plot(
+        sc$locations[, "x"], sc$locations[, "y"],
+        pch  = 19,
+        cex  = 0.5 + 2.5 * v / max(v),
+        col  = hcl.colors(50, "YlOrRd", rev = TRUE)[
+          cut(v, breaks = 50, labels = FALSE)
+        ],
+        xlab = "x", ylab = "y",
+        main = sprintf("%s (range = %g)", id, sc$config$corr$range)
+      )
+    }
+  }
+
+  draw_compare()
+
+  save_base_plot(quote(draw_compare()), "05_compare",
+                 width = 12, height = 5)
+} else {
+  message("Only one scenario on disk; skipping comparison plot.")
+}
+```
+
+### Option 6: Interactive plotly
+
+```{r viz_plotly, fig.width = 7, fig.height = 6}
+if (requireNamespace("plotly", quietly = TRUE)) {
+  library(plotly)
+
+  p_int <- plot_ly(
+    df,
+    x        = ~x, y = ~y,
+    type     = "scatter", mode = "markers",
+    marker   = list(
+      size       = ~count * 3 + 5,
+      color      = ~count,
+      colorscale = "Viridis",
+      showscale  = TRUE
+    ),
+    text      = ~paste("count:", count),
+    hoverinfo = "text"
+  ) %>%
+    layout(title = "H18-B counts (hover for values)")
+
+  p_int
+
+  if (requireNamespace("htmlwidgets", quietly = TRUE)) {
+    out_html <- file.path(viz_dir, "06_plotly.html")
+    htmlwidgets::saveWidget(p_int, out_html, selfcontained = TRUE)
+    message("Saved: ", out_html)
+  } else {
+    message("Install htmlwidgets to save plotly output: install.packages('htmlwidgets')")
+  }
+} else {
+  message("Install plotly with install.packages('plotly') to use this.")
+}
+```
+
+### What got saved
+
+```{r viz_list}
+list.files(viz_dir, full.names = FALSE)
+```
