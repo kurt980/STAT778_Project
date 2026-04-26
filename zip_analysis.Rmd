@@ -1,0 +1,233 @@
+---
+title: 'ZIP Analysis: Zero-Inflation and Its Misspecification'
+author: "STAT778 Project"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: yes
+  html_document:
+    toc: yes
+    toc_float: yes
+    theme: flatly
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(message = TRUE, warning = FALSE,
+                      fig.width = 9, fig.height = 5)
+```
+
+## Purpose
+
+Analyzes the ZIP (zero-inflated Poisson) study. Three generating
+levels of zero-inflation (p0 = 0, 0.2, 0.4), each fit two ways:
+
+- **Well-specified:** fit as ZIP.
+- **Misspecified:** fit as Poisson (ignoring the excess zeros).
+
+Question: does ignoring zero-inflation systematically bias estimates?
+Does GHK cope better than GQT, or vice versa?
+
+---
+
+## Load and tidy
+
+```{r load}
+source("code/R/logging.R")
+source("code/R/io.R")
+source("code/R/fit_core.R")
+
+DATASET <- "ZIP"
+inventory <- list_fit_results(DATASET, dir = "data/fits")
+inventory
+```
+
+The inventory should show 6 rows: 3 scenarios × {ZIP fit, Poisson
+fit}. The `misspec_family` column is NA for ZIP fits and
+`"poisson"` for misspecified fits.
+
+```{r load_all}
+fits <- lapply(seq_len(nrow(inventory)), function(i) {
+  load_fit_result(
+    DATASET,
+    inventory$scenario_id[i],
+    misspec_family = if (is.na(inventory$misspec_family[i])) NULL else inventory$misspec_family[i]
+  )
+})
+names(fits) <- paste(inventory$scenario_id,
+                     ifelse(is.na(inventory$misspec_family),
+                            "wellspec", inventory$misspec_family),
+                     sep = "__")
+names(fits)
+```
+
+### Tidy to long
+
+```{r tidy}
+tidy_one <- function(f) {
+  r   <- f$results
+  cfg <- f$scenario_config
+
+  rows <- list()
+  for (i in seq_len(nrow(r))) {
+    if (!r$converged[i]) next
+    est <- r$estimates[[i]]
+    if (is.null(est) || length(est) == 0) next
+    for (pname in names(est)) {
+      rows[[length(rows) + 1]] <- data.frame(
+        scenario_id   = f$scenario_id,
+        p0            = cfg$marginal$od,
+        fit_family    = f$fit_marginal_spec$family,
+        misspecified  = f$misspecified,
+        replicate     = r$replicate[i],
+        method        = r$method[i],
+        runtime_sec   = r$runtime_sec[i],
+        parameter     = pname,
+        estimate      = as.numeric(est[[pname]]),
+        stringsAsFactors = FALSE
+      )
+    }
+  }
+  do.call(rbind, rows)
+}
+
+long <- do.call(rbind, lapply(fits, tidy_one))
+nrow(long)
+head(long)
+```
+
+### Attach truth
+
+```{r attach_truth}
+long$truth <- NA_real_
+long$truth[long$parameter %in% "Intercept"] <- log(5)   # lambda = 5
+long$truth[long$parameter %in% "range"]     <- 0.3
+
+long$abs_err <- abs(long$estimate - long$truth)
+long$err     <- long$estimate - long$truth
+```
+
+---
+
+## Convergence by cell
+
+```{r conv}
+conv <- aggregate(
+  converged ~ p0 + fit_family + method,
+  data = unique(do.call(rbind, lapply(fits, function(f) {
+    cbind(p0 = f$scenario_config$marginal$od,
+          fit_family = f$fit_marginal_spec$family,
+          f$results[, c("replicate", "method", "converged")])
+  }))),
+  FUN = function(x) mean(x)
+)
+conv
+```
+
+---
+
+## MAE comparison
+
+```{r mae}
+mae_tab <- aggregate(
+  abs_err ~ p0 + fit_family + method + parameter,
+  data = long,
+  FUN  = mean
+)
+names(mae_tab)[5] <- "MAE"
+
+mae_tab[order(mae_tab$parameter, mae_tab$p0, mae_tab$fit_family,
+              mae_tab$method), ]
+```
+
+### Wide view: well-specified vs misspecified, side by side
+
+```{r mae_wide}
+mae_wide <- reshape(
+  mae_tab,
+  idvar = c("p0", "method", "parameter"),
+  timevar = "fit_family",
+  direction = "wide"
+)
+mae_wide$diff <- mae_wide$MAE.poisson - mae_wide$MAE.zip
+mae_wide$pct  <- 100 * mae_wide$diff / mae_wide$MAE.zip
+mae_wide[order(mae_wide$parameter, mae_wide$p0, mae_wide$method), ]
+```
+
+**Report claim shape:** "Fitting Poisson to ZIP data at p0 = 0.4
+inflates MAE on the intercept by roughly X%..."
+
+### Figure
+
+```{r plot_mae, fig.width = 10, fig.height = 5}
+par(mfrow = c(1, 2))
+
+for (param in c("Intercept", "range")) {
+  d <- mae_tab[mae_tab$parameter == param, ]
+  y_max <- max(d$MAE) * 1.1
+  plot(NA, xlim = c(0, 0.45), ylim = c(0, y_max),
+       xlab = "zero-inflation probability p0",
+       ylab = "MAE",
+       main = sprintf("MAE vs p0 -- %s", param))
+  for (ff in c("zip", "poisson")) {
+    for (m in c("GHK", "GQT")) {
+      sub <- d[d$fit_family == ff & d$method == m, ]
+      sub <- sub[order(sub$p0), ]
+      col  <- if (ff == "zip") "darkgreen" else "firebrick"
+      lty  <- if (m == "GHK") 1 else 2
+      lines(sub$p0, sub$MAE, col = col, lty = lty, lwd = 2)
+      points(sub$p0, sub$MAE, col = col, pch = 19, cex = 1.2)
+    }
+  }
+  legend("topleft",
+         legend = c("ZIP fit (well-spec)", "Poisson fit (misspec)",
+                    "GHK (solid)", "GQT (dashed)"),
+         col = c("darkgreen", "firebrick", "black", "black"),
+         lty = c(1, 1, 1, 2), lwd = 2, bty = "n", cex = 0.85)
+}
+par(mfrow = c(1, 1))
+```
+
+### Save
+
+```{r save_fig, eval = FALSE}
+dir.create("visualization/zip", recursive = TRUE, showWarnings = FALSE)
+pdf("visualization/zip/mae_vs_p0.pdf", width = 10, height = 5)
+# <paste the plot_mae code here>
+dev.off()
+```
+
+---
+
+## Summary
+
+```{r summary}
+cat("=== ZIP study summary ===\n\n")
+
+for (p0_val in c(0, 0.2, 0.4)) {
+  cat(sprintf("\n-- p0 = %g --\n", p0_val))
+  for (param in c("Intercept", "range")) {
+    zip_mae <- mean(long$abs_err[long$p0 == p0_val &
+                                 long$fit_family == "zip" &
+                                 long$parameter == param],
+                    na.rm = TRUE)
+    pois_mae <- mean(long$abs_err[long$p0 == p0_val &
+                                  long$fit_family == "poisson" &
+                                  long$parameter == param],
+                     na.rm = TRUE)
+    cat(sprintf("  %-9s  ZIP fit MAE=%.4f  Poisson fit MAE=%.4f  (ratio=%.2fx)\n",
+                param, zip_mae, pois_mae, pois_mae / zip_mae))
+  }
+}
+```
+
+### Likely findings for the report
+
+Fill in:
+
+1. At p0 = 0 (no zero-inflation), ZIP and Poisson fits produce
+   equivalent MAE (both well-specified).
+2. At p0 > 0, Poisson fits ___ the Intercept by ___% more MAE than
+   the ZIP fit.
+3. Range estimates are ___ (possibly less affected than Intercept,
+   since zero-inflation is a marginal property).
+4. GHK and GQT degrade ___ (together / differently).

@@ -1,0 +1,492 @@
+---
+title: 'K13A-GRID Analysis: GHK vs GQT Across the Parameter Grid'
+author: "STAT778 Project"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: yes
+    toc_depth: '3'
+  html_document:
+    toc: yes
+    toc_float: yes
+    toc_depth: 3
+    theme: flatly
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  message = TRUE,
+  warning = FALSE,
+  fig.width  = 9,
+  fig.height = 6
+)
+```
+
+## What this Rmd does
+
+Analyzes the 18-cell grid study (Day 4): 2 sample sizes x 3 ranges x
+3 lambda values, each with 200 replicates fit by both GHK and GQT.
+Produces the tables and figures that anchor the report's simulation
+results section.
+
+**Organization.** Section 1 tidies the raw fit results into a long
+data frame. Sections 2-5 produce specific outputs (convergence,
+runtime, estimates, MAE). Section 6 summarizes findings.
+
+---
+
+## Section 1: Load and tidy
+
+### Load every cell
+
+```{r load}
+source("code/R/logging.R")
+source("code/R/io.R")
+source("code/R/fit_core.R")
+
+DATASET <- "K13A-GRID"
+
+ids <- list_scenarios(DATASET, dir = "data/generated")
+length(ids)   # should be 18
+```
+
+```{r load_all}
+# Load all fit results. Each one is a list with dataset_id,
+# scenario_id, results (data frame), and metadata.
+fits <- lapply(ids, function(id) load_fit_result(DATASET, id))
+names(fits) <- ids
+```
+
+Quick sanity check — same shape everywhere?
+
+```{r sanity}
+sapply(fits, function(f) nrow(f$results))   # should all be 400 (200 x 2)
+```
+
+### Extract cell parameters from each scenario_id
+
+The scenario_id encodes (n, range, lambda) so we don't need to dig
+into each config. But parsing out of the filename is a fragile
+convention — better to pull from the stored config.
+
+```{r extract_cell_params}
+cell_info <- do.call(rbind, lapply(fits, function(f) {
+  cfg <- f$scenario_config
+  data.frame(
+    scenario_id = cfg$scenario_id,
+    n_total     = cfg$layout$n_side^2,
+    range       = cfg$corr$range,
+    lambda      = cfg$marginal$lambda,
+    stringsAsFactors = FALSE
+  )
+}))
+
+head(cell_info)
+```
+
+### Tidy to long format
+
+One row per (scenario, replicate, method, parameter). This is the
+shape that makes aggregation easy.
+
+```{r tidy_long}
+tidy_one <- function(f) {
+  r <- f$results
+  cfg <- f$scenario_config
+
+  rows <- list()
+  for (i in seq_len(nrow(r))) {
+    if (!r$converged[i]) {
+      # record a single "failed" row so failures are visible
+      rows[[length(rows) + 1]] <- data.frame(
+        scenario_id = f$scenario_id,
+        n_total     = cfg$layout$n_side^2,
+        range       = cfg$corr$range,
+        lambda      = cfg$marginal$lambda,
+        replicate   = r$replicate[i],
+        method      = r$method[i],
+        converged   = FALSE,
+        runtime_sec = r$runtime_sec[i],
+        parameter   = NA_character_,
+        estimate    = NA_real_,
+        stringsAsFactors = FALSE
+      )
+      next
+    }
+
+    est <- r$estimates[[i]]
+    if (is.null(est) || length(est) == 0) next
+
+    for (pname in names(est)) {
+      rows[[length(rows) + 1]] <- data.frame(
+        scenario_id = f$scenario_id,
+        n_total     = cfg$layout$n_side^2,
+        range       = cfg$corr$range,
+        lambda      = cfg$marginal$lambda,
+        replicate   = r$replicate[i],
+        method      = r$method[i],
+        converged   = TRUE,
+        runtime_sec = r$runtime_sec[i],
+        parameter   = pname,
+        estimate    = as.numeric(est[[pname]]),
+        stringsAsFactors = FALSE
+      )
+    }
+  }
+
+  do.call(rbind, rows)
+}
+
+long <- do.call(rbind, lapply(fits, tidy_one))
+nrow(long)
+head(long)
+```
+
+### Attach truth
+
+```{r attach_truth}
+# gcKrig's Poisson intercept is on the log scale; truth is log(lambda).
+long$truth <- NA_real_
+long$truth[long$parameter %in% "Intercept"] <- log(long$lambda[long$parameter %in% "Intercept"])
+long$truth[long$parameter %in% "range"]     <- long$range[long$parameter %in% "range"]
+
+long$abs_err <- abs(long$estimate - long$truth)
+long$err     <- long$estimate - long$truth   # signed, for bias
+
+head(long[, c("scenario_id", "method", "parameter", "estimate", "truth", "err")])
+```
+
+---
+
+## Section 2: Convergence diagnostics
+
+```{r convergence_table}
+conv_tab <- aggregate(
+  converged ~ n_total + range + lambda + method,
+  data = unique(long[, c("scenario_id", "replicate", "method",
+                         "n_total", "range", "lambda", "converged")]),
+  FUN  = function(x) sum(x) / length(x)
+)
+names(conv_tab)[5] <- "conv_rate"
+
+# Flag any cell below 99% convergence
+conv_tab[conv_tab$conv_rate < 0.99, ]
+```
+
+If that's empty, every cell had at least 99% convergence. Good.
+
+```{r convergence_summary}
+cat("Overall convergence by method:\n")
+print(aggregate(conv_rate ~ method, data = conv_tab, FUN = mean))
+```
+
+---
+
+## Section 3: Runtime comparison
+
+```{r runtime_table}
+rt <- long[long$converged, ]
+rt <- unique(rt[, c("scenario_id", "replicate", "method", "n_total",
+                    "range", "lambda", "runtime_sec")])
+
+runtime_summary <- aggregate(
+  runtime_sec ~ n_total + method,
+  data = rt,
+  FUN  = function(x) c(mean = mean(x), median = median(x),
+                       min = min(x), max = max(x))
+)
+runtime_summary
+```
+
+### Headline: GHK vs GQT speed ratio
+
+```{r runtime_ratio}
+rt_means <- aggregate(runtime_sec ~ n_total + method, data = rt, FUN = mean)
+rt_wide <- reshape(rt_means, idvar = "n_total", timevar = "method",
+                   direction = "wide")
+rt_wide$ratio_GHK_to_GQT <- rt_wide$runtime_sec.GHK / rt_wide$runtime_sec.GQT
+rt_wide
+```
+
+This is the number for the report: "GQT is roughly Xx faster than GHK
+at n=25, and Yx faster at n=49."
+
+### Plot: runtime by cell
+
+```{r plot_runtime, fig.width = 9, fig.height = 5}
+par(mfrow = c(1, 2))
+
+for (n_val in sort(unique(rt$n_total))) {
+  sub <- rt[rt$n_total == n_val, ]
+  boxplot(
+    runtime_sec ~ method, data = sub,
+    log = "y",
+    main = sprintf("Runtime at n=%d (log scale)", n_val),
+    ylab = "seconds per fit"
+  )
+}
+
+par(mfrow = c(1, 1))
+```
+
+---
+
+## Section 4: Parameter estimates
+
+### Means and SDs per cell
+
+```{r estimate_summary}
+est_summary <- aggregate(
+  estimate ~ n_total + range + lambda + method + parameter,
+  data = long[long$converged, ],
+  FUN  = function(x) c(mean = mean(x), sd = sd(x), n = length(x))
+)
+
+# flatten the aggregated value column for display
+est_display <- do.call(data.frame, est_summary)
+head(est_display)
+```
+
+### Bias (signed error)
+
+```{r bias_table}
+bias_tab <- aggregate(
+  err ~ n_total + range + lambda + method + parameter,
+  data = long[long$converged, ],
+  FUN  = mean
+)
+names(bias_tab)[6] <- "bias"
+
+# Split by parameter for readability
+bias_intercept <- bias_tab[bias_tab$parameter == "Intercept", ]
+bias_range     <- bias_tab[bias_tab$parameter == "range", ]
+
+cat("Bias for log-Intercept:\n")
+print(bias_intercept, row.names = FALSE)
+
+cat("\nBias for range:\n")
+print(bias_range, row.names = FALSE)
+```
+
+**What to look for.** Values close to zero mean the estimate is on
+average correct. Range estimates tend to be *negatively biased* —
+finite samples underestimate spatial dependence. Intercept estimates
+are usually closer to unbiased.
+
+---
+
+## Section 5: MAE — the headline table and figure
+
+### MAE per cell
+
+```{r mae_table}
+mae_tab <- aggregate(
+  abs_err ~ n_total + range + lambda + method + parameter,
+  data = long[long$converged, ],
+  FUN  = mean
+)
+names(mae_tab)[6] <- "MAE"
+
+# Two sub-tables for the report: one per parameter.
+mae_intercept <- mae_tab[mae_tab$parameter == "Intercept", ]
+mae_range     <- mae_tab[mae_tab$parameter == "range", ]
+
+cat("MAE for log-Intercept:\n")
+print(mae_intercept[order(mae_intercept$n_total, mae_intercept$range,
+                          mae_intercept$lambda, mae_intercept$method), ],
+      row.names = FALSE, digits = 3)
+
+cat("\nMAE for range:\n")
+print(mae_range[order(mae_range$n_total, mae_range$range,
+                      mae_range$lambda, mae_range$method), ],
+      row.names = FALSE, digits = 3)
+```
+
+### Direct GHK vs GQT MAE comparison
+
+The cleanest way to see whether GQT keeps up with GHK everywhere is a
+wide table: one row per cell, separate columns for each method, and a
+difference.
+
+```{r mae_compare_wide}
+mae_wide <- reshape(
+  mae_tab,
+  idvar     = c("n_total", "range", "lambda", "parameter"),
+  timevar   = "method",
+  direction = "wide"
+)
+mae_wide$diff <- mae_wide$MAE.GQT - mae_wide$MAE.GHK
+mae_wide$pct_diff <- 100 * mae_wide$diff / mae_wide$MAE.GHK
+
+mae_wide <- mae_wide[order(mae_wide$parameter, mae_wide$n_total,
+                           mae_wide$range, mae_wide$lambda), ]
+print(mae_wide, row.names = FALSE, digits = 3)
+```
+
+**Report claim would be something like:** "Across the 18 cells, GQT's
+MAE differs from GHK's by less than X% for the intercept and less
+than Y% for the range parameter."
+
+### The Figure-1 equivalent: MAE vs sample size
+
+Kazianka's paper plots MAE as a function of n, faceted by range,
+with colored lines for different methods or lambda values. Even with
+only n in {25, 49}, the plot is informative.
+
+```{r plot_mae_figure, fig.width = 10, fig.height = 6}
+# Separate panels for the two parameters. Base-R approach because
+# the report may ultimately use ggplot for final; this is the
+# exploratory version.
+
+plot_mae_panel <- function(param_name) {
+  dat <- mae_tab[mae_tab$parameter == param_name, ]
+  ranges <- sort(unique(dat$range))
+
+  par(mfrow = c(1, length(ranges)),
+      oma = c(0, 0, 3, 0), mar = c(4, 4, 3, 1))
+
+  for (r in ranges) {
+    d <- dat[dat$range == r, ]
+    y_max <- max(d$MAE, na.rm = TRUE) * 1.1
+
+    # One line per method; x = n_total; color by lambda
+    plot(NA, xlim = range(d$n_total), ylim = c(0, y_max),
+         xlab = "n", ylab = "MAE",
+         main = sprintf("range = %g", r))
+
+    lams <- sort(unique(d$lambda))
+    cols <- c("firebrick", "steelblue", "darkgreen")
+    ltys <- c(1, 2)  # solid = GHK, dashed = GQT
+
+    for (li in seq_along(lams)) {
+      for (mi in seq_along(c("GHK", "GQT"))) {
+        m <- c("GHK", "GQT")[mi]
+        sub <- d[d$lambda == lams[li] & d$method == m, ]
+        sub <- sub[order(sub$n_total), ]
+        lines(sub$n_total, sub$MAE,
+              col = cols[li], lty = ltys[mi], lwd = 2)
+        points(sub$n_total, sub$MAE,
+               col = cols[li], pch = 19)
+      }
+    }
+  }
+
+  mtext(sprintf("MAE vs n for parameter %s  (solid=GHK, dashed=GQT, colors=lambda)",
+                param_name),
+        outer = TRUE, cex = 1.2)
+  par(mfrow = c(1, 1))
+}
+
+plot_mae_panel("Intercept")
+```
+
+```{r plot_mae_range, fig.width = 10, fig.height = 6}
+plot_mae_panel("range")
+```
+
+### Save the figures
+
+```{r save_figures, eval = FALSE}
+dir.create("visualization/k13a_grid", recursive = TRUE, showWarnings = FALSE)
+
+pdf("visualization/k13a_grid/mae_intercept.pdf", width = 10, height = 6)
+plot_mae_panel("Intercept")
+dev.off()
+
+pdf("visualization/k13a_grid/mae_range.pdf", width = 10, height = 6)
+plot_mae_panel("range")
+dev.off()
+
+message("Figures saved to visualization/k13a_grid/")
+```
+
+---
+
+## Section 6: Summary for the report
+
+Brief checklist of what the results say. Fill in the actual numbers
+after running the chunks above.
+
+```{r summary_stats}
+# Convergence
+cat("Overall convergence:\n")
+print(round(tapply(long$converged[long$parameter == "Intercept" | is.na(long$parameter)],
+                   long$method[long$parameter == "Intercept" | is.na(long$parameter)],
+                   mean), 4))
+
+# Runtime speedup
+cat("\nMean runtime:\n")
+print(tapply(rt$runtime_sec, rt$method, mean))
+cat(sprintf("\nGQT speedup over GHK: %.1fx\n",
+            mean(rt$runtime_sec[rt$method == "GHK"]) /
+            mean(rt$runtime_sec[rt$method == "GQT"])))
+
+# Max MAE difference
+max_diff_pct <- max(abs(mae_wide$pct_diff), na.rm = TRUE)
+cat(sprintf("\nMax |MAE difference| between GHK and GQT: %.2f%%\n", max_diff_pct))
+```
+
+### Likely findings to report
+
+Fill in as the numbers come out:
+
+1. **Convergence.** Both methods converge at ___% across the 18
+   cells.
+2. **Runtime.** GQT is ~___x faster than GHK on average.
+3. **Accuracy.** Across all 18 cells, GHK and GQT produce MAE values
+   within ___% of each other for both parameters.
+4. **Sample size effect.** MAE decreases by roughly a factor of
+   ___ going from n=25 to n=49, consistent with a sqrt(n)
+   convergence rate.
+5. **Range effect.** MAE of the range parameter grows with the true
+   range value — larger ranges are harder to identify at fixed n.
+6. **Lambda effect.** Lower-intensity cells (lambda=1) have [more/less]
+   variability in estimates.
+7. **Any surprises.** [Fill in any cell where GQT materially
+   underperformed GHK, if any.]
+
+---
+
+## Section 7: Tables for the report
+
+LaTeX-ready tables. These can be pasted into the report directly
+(wrapped in a `\begin{tabular}` environment).
+
+```{r latex_runtime}
+cat("\n% ---- Runtime table ----\n")
+rt_summary_simple <- aggregate(
+  runtime_sec ~ n_total + method,
+  data = rt,
+  FUN  = mean
+)
+
+for (i in seq_len(nrow(rt_summary_simple))) {
+  cat(sprintf("%d & %s & %.3f \\\\\n",
+              rt_summary_simple$n_total[i],
+              rt_summary_simple$method[i],
+              rt_summary_simple$runtime_sec[i]))
+}
+```
+
+```{r latex_mae}
+cat("\n% ---- MAE table (Intercept) ----\n")
+for (i in seq_len(nrow(mae_intercept))) {
+  cat(sprintf("%d & %g & %g & %s & %.4f \\\\\n",
+              mae_intercept$n_total[i],
+              mae_intercept$range[i],
+              mae_intercept$lambda[i],
+              mae_intercept$method[i],
+              mae_intercept$MAE[i]))
+}
+```
+
+---
+
+## End of K13A-GRID analysis
+
+Next steps:
+- `k13a_pilot_analysis.Rmd` — Day-1 pilot (sim_n=200) as a single
+  reference point, plus H18-B (sim_n=1) just for the figure.
+- `misspec_analysis.Rmd` — 2x2 factorial analysis of the MISSPEC
+  study.
+- Then the missingness and zero-inflation extensions.

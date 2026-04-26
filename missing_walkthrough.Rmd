@@ -1,0 +1,427 @@
+---
+title: "Missingness End-to-End: Generation, Masking, Fitting, Inspection"
+author: "STAT778 Project"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  message = TRUE,
+  warning = FALSE,
+  fig.width  = 8,
+  fig.height = 5
+)
+```
+
+## Purpose
+
+Walk through the full missingness pipeline interactively. Tests the
+masking logic, the NA-aware fitting, and inspection of a single
+scenario before committing to the full Slurm run.
+
+**Safety convention.** The full 5-scenario x 2-method x 200-replicate
+run is marked `eval = FALSE` — Knit completes quickly, and the
+expensive chunk is only executed when you click the green arrow.
+All the smoke-test chunks do run on Knit.
+
+---
+
+## Background: what this study does
+
+**Goal.** Test the robustness of gcKrig estimators under Missing
+Completely At Random (MCAR) missingness. Take the K13-A baseline
+(Poisson(5), n=49, range=0.3) and randomly mask a fraction of
+observations per replicate, then fit. Compare the resulting MAE and
+bias to the unmasked baseline.
+
+**Why MCAR specifically.** Under MCAR, the decision of which
+observations are missing is independent of their values. Estimators
+remain theoretically unbiased; only their variance grows. This
+gives us a clean test of how gracefully gcKrig handles reduced
+effective sample size. (Non-random missingness — e.g., masking
+large values preferentially — would be a different study that
+deliberately violates the MCAR assumption.)
+
+**Scenarios.** Five missingness rates: 0%, 10%, 20%, 30%, 50%. All
+share the same underlying simulated data (same seed); only the
+mask differs. This keeps the comparison honest: observed
+differences in MAE arise purely from data availability, not from
+sampling variability in the generating process.
+
+**Expected findings.**
+
+| Quantity | Expectation |
+|----------|-------------|
+| Convergence rate | ~100% at all rates up to 50% |
+| Bias | Near zero at all rates (MCAR property) |
+| MAE, rate=0 | Matches K13-A default baseline |
+| MAE growth | Roughly linear in rate, moderate even at 50% |
+| Runtime | Decreases with rate (smaller covariance matrix) |
+| GHK vs GQT | Degrade at similar rates; no clear winner |
+
+If results deviate sharply from these expectations (e.g., bias
+grows with rate, or convergence breaks down above 30%), that itself
+becomes a finding worth discussing in the report.
+
+---
+
+## Load the pipeline
+test
+```{r test}
+source("code/R/logging.R"); source("code/R/io.R"); source("code/R/fit_core.R")
+source("code/R/grids.R"); source("code/R/spec_utils.R"); source("code/R/sim_core.R")
+source("code/R/missingness.R"); source("code/configs/missing.R")
+library(gcKrig)
+
+# Generate a quick test scenario
+spec <- MISSING_SCENARIOS$mcar_rate50
+locs <- do.call(make_locations, spec$layout)
+base_scen <- simulate_mc_scenario(spec = spec, locations = locs,
+  marginal = poisson.gc(lambda = 5),
+  corr = matern.gc(range = 0.3, kappa = 0.5, nugget = 0))
+masked <- apply_mcar(base_scen, missing_rate = 0.5)
+
+# Fit 2 replicates
+fit_scenario(masked, replicates = 1:2)
+```
+
+```{r load_pipeline}
+suppressPackageStartupMessages({
+  library(gcKrig)
+})
+
+source("code/R/logging.R")
+source("code/R/grids.R")
+source("code/R/spec_utils.R")
+source("code/R/sim_core.R")
+source("code/R/io.R")
+source("code/R/missingness.R")
+source("code/R/fit_core.R")
+source("code/configs/missing.R")
+```
+
+### Peek at the scenarios list
+
+```{r show_scenarios}
+names(MISSING_SCENARIOS)
+
+# Inspect one:
+str(MISSING_SCENARIOS$mcar_rate30, max.level = 2)
+```
+
+Note that the rate is stored in `$missing_rate`, and all five
+scenarios share the same `$seed` (20240601). The rate governs how
+much of the simulated data gets masked; the seed governs the
+underlying simulation, which is identical across all five.
+
+---
+
+## Part 1: Generate a test scenario
+
+### Simulate the baseline first (no masking yet)
+
+```{r generate_baseline}
+spec <- MISSING_SCENARIOS$mcar_rate30   # 30% missingness
+
+locs <- do.call(make_locations, spec$layout)
+
+marginal_obj <- poisson.gc(lambda = spec$marginal$lambda)
+corr_obj     <- matern.gc(range  = spec$corr$range,
+                          kappa  = spec$corr$kappa,
+                          nugget = spec$corr$nugget)
+
+scenario_unmasked <- simulate_mc_scenario(
+  spec        = spec,
+  locations   = locs,
+  marginal    = marginal_obj,
+  corr        = corr_obj,
+  true_params = list(lambda = 5, range = 0.3, kappa = 0.5, nugget = 0)
+)
+
+cat("Unmasked shape:", dim(scenario_unmasked$values), "\n")
+cat("NA count:      ", sum(is.na(scenario_unmasked$values)), "\n")
+cat("Sample values (replicate 1):\n")
+print(scenario_unmasked$values[1:10, 1])
+```
+
+### Apply MCAR masking
+
+```{r apply_masking}
+scenario_masked <- apply_mcar(scenario_unmasked, missing_rate = 0.3)
+
+cat("Masked shape:   ", dim(scenario_masked$values), "\n")
+cat("NA count:       ", sum(is.na(scenario_masked$values)), "\n")
+cat("Fraction NA:    ", round(mean(is.na(scenario_masked$values)), 3), "\n")
+cat("Full preserved: ", !is.null(scenario_masked$values_full), "\n")
+cat("\nSample values (replicate 1), masked:\n")
+print(scenario_masked$values[1:10, 1])
+cat("\nSame replicate, original:\n")
+print(scenario_masked$values_full[1:10, 1])
+```
+
+Expected: the two vectors above differ exactly in positions where
+the mask set a value to NA. Everything else is identical. The
+scenario now carries both `$values` (with NAs) and `$values_full`
+(the pre-masking original), plus a `$missingness_spec` record:
+
+```{r missingness_spec}
+str(scenario_masked$missingness_spec)
+```
+
+---
+
+## Part 2: Visualize the masking pattern
+
+### Compare spatial patterns: all 49 vs. 30% masked
+
+```{r plot_masking, fig.width = 10, fig.height = 5}
+par(mfrow = c(1, 2))
+
+v_full <- scenario_masked$values_full[, 1]
+v_mask <- scenario_masked$values[, 1]
+
+plot(
+  scenario_masked$locations[, "x"],
+  scenario_masked$locations[, "y"],
+  pch  = 19,
+  cex  = 0.5 + 2 * v_full / max(v_full),
+  col  = hcl.colors(50, "YlOrRd", rev = TRUE)[
+    cut(v_full, breaks = 50, labels = FALSE)
+  ],
+  xlab = "x", ylab = "y",
+  main = "Complete data (n=49)"
+)
+
+# Grey out missing points
+col_mask <- ifelse(is.na(v_mask), "grey70",
+  hcl.colors(50, "YlOrRd", rev = TRUE)[cut(v_full, breaks = 50, labels = FALSE)])
+cex_mask <- ifelse(is.na(v_mask), 1.5, 0.5 + 2 * v_full / max(v_full))
+pch_mask <- ifelse(is.na(v_mask), 4, 19)
+
+plot(
+  scenario_masked$locations[, "x"],
+  scenario_masked$locations[, "y"],
+  pch  = pch_mask,
+  cex  = cex_mask,
+  col  = col_mask,
+  xlab = "x", ylab = "y",
+  main = "Observed data (n=34, 30% masked)"
+)
+
+par(mfrow = c(1, 1))
+```
+
+The left panel shows the full generating process; the right panel
+shows what a fit would actually see. X marks are the masked points.
+
+---
+
+## Part 3: Smoke-test fitting
+
+Before launching the full study, fit the masked scenario on 1
+replicate with each method. Verifies that `.fit_one()` correctly
+drops NA rows and that `n_used` reports the reduced sample size.
+
+```{r smoke_fit}
+log_info("Smoke test: fitting masked scenario, replicate 1, both methods.")
+
+smoke <- fit_scenario(
+  scenario   = scenario_masked,
+  methods    = c("GHK", "GQT"),
+  replicates = 1
+)
+```
+
+```{r smoke_inspect}
+cat("Results for replicate 1:\n")
+print(smoke$results[, c("method", "converged", "runtime_sec",
+                        "n_used", "n_full", "error_message")])
+
+cat("\nGHK estimates:\n")
+print(smoke$results$estimates[[1]])
+cat("\nGQT estimates:\n")
+print(smoke$results$estimates[[2]])
+cat("\nTrue values: log(5) =", log(5), ", range = 0.3\n")
+```
+
+**What to check:**
+
+- `converged` should be TRUE for both rows.
+- `n_used` should be around 34 (49 × 0.7), reflecting that 30% were
+  masked. If it's 49, the masking isn't propagating to the fitter.
+- Estimates should be near the truth. Single-replicate noise is
+  normal; the Intercept should be in the 1.4 to 1.8 range,
+  range should be in the 0.15 to 0.45 range.
+
+---
+
+## Part 4: Compare masked vs unmasked fits on the same replicate
+
+Worth seeing directly: does losing 30% of the data change the
+estimates much?
+
+```{r compare_masked_unmasked}
+log_info("Fitting the SAME replicate with and without masking.")
+
+smoke_full <- fit_scenario(
+  scenario   = scenario_unmasked,
+  methods    = c("GHK", "GQT"),
+  replicates = 1
+)
+
+# Compare estimates side by side
+compare_tab <- data.frame(
+  method   = rep(c("GHK", "GQT"), 2),
+  scenario = rep(c("complete", "masked30"), each = 2),
+  intercept = c(
+    smoke_full$results$estimates[[1]]$Intercept,
+    smoke_full$results$estimates[[2]]$Intercept,
+    smoke$results$estimates[[1]]$Intercept,
+    smoke$results$estimates[[2]]$Intercept
+  ),
+  range = c(
+    smoke_full$results$estimates[[1]]$range,
+    smoke_full$results$estimates[[2]]$range,
+    smoke$results$estimates[[1]]$range,
+    smoke$results$estimates[[2]]$range
+  ),
+  n_used = c(
+    smoke_full$results$n_used[1:2],
+    smoke$results$n_used[1:2]
+  ),
+  runtime_sec = round(c(
+    smoke_full$results$runtime_sec[1:2],
+    smoke$results$runtime_sec[1:2]
+  ), 3)
+)
+
+print(compare_tab, row.names = FALSE, digits = 4)
+cat("\nTruth: Intercept =", round(log(5), 4), "  range = 0.3\n")
+```
+
+Single-replicate comparison isn't meant to be statistically
+conclusive — the real comparison comes from the full study with 200
+replicates per rate. But if the masked estimates are *wildly*
+different from the unmasked ones (e.g., sign-flipped, off by an
+order of magnitude), something is wrong and we should debug before
+proceeding.
+
+---
+
+## Part 5: Full pipeline run (heavy — `eval = FALSE` by default)
+
+This is the full 5-scenario × 200-replicate × 2-method run: 2,000
+fits total. Expected runtime 15-35 minutes interactively, or launch
+via Slurm for the same work without tying up the R session.
+
+### Option A: run it here in the Rmd
+
+```{r full_run_local, eval = FALSE}
+log_info("Full missingness generation: 5 scenarios")
+
+for (scen_id in names(MISSING_SCENARIOS)) {
+  spec <- MISSING_SCENARIOS[[scen_id]]
+
+  locs <- do.call(make_locations, spec$layout)
+  scn  <- simulate_mc_scenario(
+    spec      = spec,
+    locations = locs,
+    marginal  = poisson.gc(lambda = spec$marginal$lambda),
+    corr      = matern.gc(range = spec$corr$range,
+                          kappa = spec$corr$kappa,
+                          nugget = spec$corr$nugget),
+    true_params = list(lambda = 5, range = 0.3, kappa = 0.5, nugget = 0)
+  )
+
+  if (spec$missing_rate > 0) {
+    scn <- apply_mcar(scn, missing_rate = spec$missing_rate)
+  }
+
+  save_scenario(scn)
+}
+
+log_info("Full missingness fitting: 5 scenarios")
+
+for (scen_id in names(MISSING_SCENARIOS)) {
+  scn <- load_scenario("MISSING", scen_id)
+  fit <- fit_scenario(scn, methods = c("GHK", "GQT"))
+  save_fit_result(fit)
+}
+```
+
+### Option B: run it via Slurm (recommended)
+
+```bash
+sbatch code/slurm/05_gen_missing.slurm
+# wait for it to finish
+sbatch code/slurm/13_fit_missing.slurm
+```
+
+Either way produces the same files. Option B is better when you
+don't want to occupy an R session for 30+ minutes.
+
+---
+
+## Part 6: Inspect results
+
+Once the full run has completed (whichever path), load results and
+check them. See `missing_analysis.Rmd` for the full analysis; this
+section is a quick sanity check.
+
+```{r inspect_results}
+avail <- list_fit_results("MISSING")
+
+if (nrow(avail) > 0) {
+  cat("Available fit results:\n")
+  print(avail, row.names = FALSE)
+
+  # Load rate=0 and rate=50 for quick contrast
+  fr0  <- load_fit_result("MISSING", "mcar_rate0")
+  fr50 <- load_fit_result("MISSING", "mcar_rate50")
+
+  cat("\n=== rate=0 (no masking) ===\n")
+  cat("Converged:", sum(fr0$results$converged), "/", nrow(fr0$results), "\n")
+  cat("Mean n_used:", mean(fr0$results$n_used), "\n")
+
+  cat("\n=== rate=50 ===\n")
+  cat("Converged:", sum(fr50$results$converged), "/", nrow(fr50$results), "\n")
+  cat("Mean n_used:", mean(fr50$results$n_used), "\n")
+
+} else {
+  message("No MISSING fit results yet. Run the full pipeline first.")
+}
+```
+
+**Sanity signals.**
+
+- rate=0 should show mean n_used = 49 exactly.
+- rate=50 should show mean n_used around 24-25.
+- Convergence should be near 100% for both.
+- If rate=50 shows materially degraded convergence, flag that as a
+  finding and investigate whether it's systemic or a handful of
+  pathological replicates.
+
+---
+
+## Next steps
+
+Once this runs cleanly end to end, the next extension is
+**zero-inflation** — generating data from a ZIP marginal and fitting
+as both ZIP (well-specified) and Poisson (misspecified). The
+infrastructure for that already exists via the misspecification
+plumbing in `fit_core.R`; the new code is a config file and a
+generation script, much like this missingness study.
+
+After that, **irregular sampling** — replacing the regular grid
+layout with random or clustered location patterns. Requires
+extending `make_locations()` with new branches but nothing
+fundamentally new at the fitter level.
+
+For analysis, see `missing_analysis.Rmd`, which reads the five fit
+result files and produces the tables and figures for the report.

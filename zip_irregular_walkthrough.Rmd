@@ -1,0 +1,33 @@
+---
+title: "zip_irregular_walkthrough"
+author: "Kurt"
+date: "4/22/2026"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# ZIP
+
+```{r}
+library(gcKrig)
+
+m <- zip.gc(mu = 5, od = 0.2)
+class(m)
+str(m)
+```
+
+# Irregular
+
+```{r}
+source("code/R/logging.R"); source("code/R/grids.R")
+locs1 <- make_locations("random_uniform", n = 49, seed = 77701)
+locs2 <- make_locations("clustered", n = 49, n_clusters = 4,
+                        scatter = 0.08, seed = 77702)
+plot(locs1); plot(locs2)
+```
+
+
+

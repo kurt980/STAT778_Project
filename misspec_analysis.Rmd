@@ -1,0 +1,797 @@
+---
+title: "Day 3 Misspecification Analysis"
+author: "STAT778 Project"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: yes
+    toc_depth: '3'
+  html_document:
+    toc: yes
+    toc_float: yes
+    toc_depth: 3
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 8,
+  fig.height = 5
+)
+```
+
+# Purpose
+
+This document analyzes the **Day 3 misspecification study**.
+
+The current Day 3 design is a (2 $\times$ 2) matrix:
+
+| Generating family | Fitting family | Meaning        |
+| ----------------- | -------------- | -------------- |
+| Poisson           | Poisson        | well-specified |
+| Poisson           | NegBin         | misspecified   |
+| NegBin            | NegBin         | well-specified |
+| NegBin            | Poisson        | misspecified   |
+
+The goals of this analysis are:
+
+1. verify that the misspecification runs completed successfully,
+2. summarize convergence and runtime,
+3. extract fitted parameter estimates,
+4. compare estimates to the correct truth where that comparison is well-defined,
+5. produce the first Day 3 tables and plots for the report.
+
+---
+
+# Background: what the pipeline is doing
+
+From the code standpoint, the Day 3 pipeline has two stages.
+
+## Generation stage
+
+The generation script creates **scenario objects**. For the current misspecification pilot, there are two generating scenarios:
+
+* `pois_pilot`
+* `nbin_pilot`
+
+Each scenario contains:
+
+* `locations`: spatial coordinates
+* `values`: a matrix of simulated datasets
+* `config`: the full generating specification
+* `true_params`: the flat generation truth
+
+In both cases:
+
+* the layout is a regular (7 $\times$ 7) grid, so (n = 49),
+* the number of Monte Carlo replicates is (B = 30),
+* the dependence structure is Matérn with:
+
+  * range (= 0.3),
+  * ($\kappa$ = 0.5),
+  * nugget (= 0).
+
+Because ($\kappa$ = 0.5), the Matérn reduces to the exponential correlation model
+$$
+\rho(h) = \exp(-h / r),
+$$
+with (r = 0.3).
+
+The marginal families differ:
+
+* `pois_pilot`: Poisson with mean ($\lambda$ = 5),
+* `nbin_pilot`: negative binomial with constant mean (5) and overdispersion `od = 1`.
+
+So each replicate is a length-49 vector of spatially correlated counts.
+
+## Fitting stage
+
+The fitting script loads a generated scenario and then fits each replicate with:
+
+* `GHK`
+* `GQT`
+
+For Day 3, the fitting wrapper can override the marginal family used in fitting. That is how misspecification is implemented.
+
+The key point is:
+
+* the **generating family** comes from `scenario$config$marginal`,
+* the **fitting family** comes from `fit_result$fit_marginal_spec`.
+
+The fitting wrapper returns a **fit-result object** with one row per `(replicate, method)` pair.
+
+So if one scenario has:
+
+* 30 replicates
+* 2 methods
+
+then the resulting `fit_result$results` table has:
+
+$$
+30 \times 2 = 60
+$$
+
+rows.
+
+---
+
+# Load packages and project code
+
+```{r load_pipeline}
+suppressPackageStartupMessages({
+  library(gcKrig)
+})
+
+source("code/R/logging.R")
+source("code/R/io.R")
+source("code/R/fit_core.R")
+```
+
+---
+
+# Load all Day 3 fit results
+
+The Day 3 fitting script is expected to write fit-result objects under:
+
+```{}
+data/fits/MISSPEC/
+```
+
+We load every `.rds` file from that directory.
+
+```{r load_fit_files}
+fit_dir <- file.path("data", "fits", "MISSPEC")
+fit_files <- list.files(fit_dir, pattern = "\\.rds$", full.names = TRUE)
+
+fit_files
+```
+
+```{r read_fit_results}
+if (length(fit_files) == 0L) {
+  stop("No Day 3 fit-result files found under data/fits/MISSPEC/.")
+}
+
+fit_objects <- lapply(fit_files, readRDS)
+names(fit_objects) <- basename(fit_files)
+
+names(fit_objects)
+```
+
+---
+
+# Inspect one fit-result object
+
+This helps remind us of the structure before building summaries.
+
+```{r inspect_one_fit_result}
+example_name <- names(fit_objects)[1]
+example_fit  <- fit_objects[[1]]
+
+cat("Example file:", example_name, "\n\n")
+str(example_fit, max.level = 1)
+```
+
+---
+
+# Helper functions
+
+These helpers flatten the nested fit-result objects into analysis-ready tables.
+
+```{r helpers}
+safe_first <- function(x, default = NA) {
+  if (length(x) == 0L || is.null(x)) return(default)
+  x[[1]]
+}
+
+pretty_cell_label <- function(gen_family, fit_family) {
+  paste0(gen_family, " \u2192 ", fit_family)
+}
+
+flatten_fit_result <- function(fr, source_file = NA_character_) {
+  res <- fr$results
+
+  out <- data.frame(
+    dataset_id      = fr$dataset_id,
+    gen_scenario_id = fr$scenario_id,
+    source_file     = source_file,
+    gen_family      = fr$scenario_config$marginal$family,
+    fit_family      = fr$fit_marginal_spec$family,
+    misspecified    = fr$misspecified,
+    replicate       = res$replicate,
+    method          = res$method,
+    converged       = res$converged,
+    error_message   = ifelse(is.na(res$error_message), "", res$error_message),
+    runtime_sec     = res$runtime_sec,
+    loglik          = res$loglik,
+    aic             = res$aic,
+    bic             = res$bic,
+    aicc            = res$aicc,
+    stringsAsFactors = FALSE
+  )
+
+  out$cell_label <- pretty_cell_label(out$gen_family, out$fit_family)
+
+  # Preserve list-columns
+  out$estimates  <- res$estimates
+  out$std_errors <- res$std_errors
+
+  out
+}
+
+normalize_param_name <- function(pname) {
+  p <- tolower(pname)
+  p <- gsub("[[:space:]]+", "", p)
+  p <- gsub("[`()]", "", p)
+  p
+}
+
+truth_for_parameter <- function(param_name, gen_config, fit_marginal_spec) {
+  p <- normalize_param_name(param_name)
+
+  gen_marg <- gen_config$marginal
+  gen_corr <- gen_config$corr
+  gen_family <- gen_marg$family
+  fit_family <- fit_marginal_spec$family
+
+  # range truth
+  if (grepl("range", p)) {
+    return(gen_corr$range)
+  }
+
+  # kappa truth, only if ever estimated
+  if (grepl("kappa", p)) {
+    return(gen_corr$kappa)
+  }
+
+  # nugget truth, only if ever estimated
+  if (grepl("nugget", p)) {
+    return(gen_corr$nugget)
+  }
+
+  # overdispersion / od truth
+  if (grepl("^od$|overdisp|dispersion|disp", p)) {
+    if (gen_family == "negbin" && fit_family == "negbin") {
+      return(gen_marg$od)
+    } else {
+      return(NA_real_)
+    }
+  }
+
+  # intercept / beta0 / mean-scale regression coefficient
+  if (grepl("intercept", p) || grepl("^beta0$", p) || grepl("^beta1$", p) ||
+      grepl("^beta$", p) || grepl("^mu$", p)) {
+    if (gen_family == "poisson") {
+      return(log(gen_marg$lambda))
+    }
+    if (gen_family == "negbin") {
+      return(gen_marg$beta[1])
+    }
+  }
+
+  # fallback: if the generating model has only one marginal coefficient
+  # and the parameter isn't a known corr/dispersion parameter, treat it
+  # as the intercept-scale mean parameter
+  if (gen_family == "poisson") {
+    return(log(gen_marg$lambda))
+  }
+  if (gen_family == "negbin") {
+    return(gen_marg$beta[1])
+  }
+
+  NA_real_
+}
+
+extract_estimates_long <- function(flat_df, fit_objects_named) {
+  rows <- list()
+  idx  <- 0L
+
+  for (i in seq_len(nrow(flat_df))) {
+    if (!isTRUE(flat_df$converged[i])) next
+
+    est <- flat_df$estimates[[i]]
+    if (is.null(est) || length(est) == 0L) next
+
+    src_name <- flat_df$source_file[i]
+    fr <- fit_objects_named[[src_name]]
+    gen_config <- fr$scenario_config
+    fit_spec   <- fr$fit_marginal_spec
+
+    for (pname in names(est)) {
+      idx <- idx + 1L
+      truth_val <- truth_for_parameter(pname, gen_config, fit_spec)
+
+      rows[[idx]] <- data.frame(
+        dataset_id      = flat_df$dataset_id[i],
+        gen_scenario_id = flat_df$gen_scenario_id[i],
+        source_file     = flat_df$source_file[i],
+        gen_family      = flat_df$gen_family[i],
+        fit_family      = flat_df$fit_family[i],
+        misspecified    = flat_df$misspecified[i],
+        cell_label      = flat_df$cell_label[i],
+        replicate       = flat_df$replicate[i],
+        method          = flat_df$method[i],
+        parameter       = pname,
+        estimate        = as.numeric(est[[pname]]),
+        truth           = truth_val,
+        abs_error       = if (is.na(truth_val)) NA_real_ else abs(as.numeric(est[[pname]]) - truth_val),
+        stringsAsFactors = FALSE
+      )
+    }
+  }
+
+  if (length(rows) == 0L) {
+    return(data.frame())
+  }
+
+  do.call(rbind, rows)
+}
+```
+
+---
+
+# Build the master fit table
+
+```{r build_master_table}
+fit_df_list <- Map(
+  function(obj, nm) flatten_fit_result(obj, source_file = nm),
+  fit_objects,
+  names(fit_objects)
+)
+
+fit_df <- do.call(rbind, fit_df_list)
+
+dim(fit_df)
+head(fit_df)
+```
+
+---
+
+# Overview of the loaded Day 3 cells
+
+```{r cell_overview}
+cell_overview <- unique(
+  fit_df[, c("gen_scenario_id", "gen_family", "fit_family", "misspecified", "cell_label", "source_file")]
+)
+
+rownames(cell_overview) <- NULL
+print(cell_overview)
+```
+
+This should show the four expected cells:
+
+* Poisson ($\rightarrow$) Poisson
+* Poisson ($\rightarrow$) NegBin
+* NegBin ($\rightarrow$) NegBin
+* NegBin ($\rightarrow$) Poisson
+
+---
+
+# Convergence summary
+
+We summarize convergence separately by:
+
+* generating family,
+* fitting family,
+* estimation method.
+
+```{r convergence_summary}
+convergence_tab <- aggregate(
+  converged ~ gen_family + fit_family + cell_label + method,
+  data = fit_df,
+  FUN = function(x) c(
+    n_total = length(x),
+    n_ok    = sum(x),
+    rate    = mean(x)
+  )
+)
+
+convergence_summary <- data.frame(
+  gen_family = convergence_tab$gen_family,
+  fit_family = convergence_tab$fit_family,
+  cell_label = convergence_tab$cell_label,
+  method     = convergence_tab$method,
+  n_total    = convergence_tab$converged[, "n_total"],
+  n_ok       = convergence_tab$converged[, "n_ok"],
+  conv_rate  = convergence_tab$converged[, "rate"]
+)
+
+print(convergence_summary, digits = 3)
+```
+
+Interpretation:
+
+* A low convergence rate means that fitting is unstable for that cell.
+* If misspecified cells converge much less often, that is already a meaningful result.
+
+---
+
+# Runtime summary
+
+We now summarize runtime among the converged fits.
+
+```{r runtime_summary}
+runtime_df <- fit_df[fit_df$converged, ]
+
+runtime_tab <- aggregate(
+  runtime_sec ~ gen_family + fit_family + cell_label + method,
+  data = runtime_df,
+  FUN = function(x) c(
+    mean   = mean(x),
+    median = stats::median(x),
+    min    = min(x),
+    max    = max(x),
+    total  = sum(x)
+  )
+)
+
+runtime_summary <- data.frame(
+  gen_family = runtime_tab$gen_family,
+  fit_family = runtime_tab$fit_family,
+  cell_label = runtime_tab$cell_label,
+  method     = runtime_tab$method,
+  mean_sec   = runtime_tab$runtime_sec[, "mean"],
+  median_sec = runtime_tab$runtime_sec[, "median"],
+  min_sec    = runtime_tab$runtime_sec[, "min"],
+  max_sec    = runtime_tab$runtime_sec[, "max"],
+  total_sec  = runtime_tab$runtime_sec[, "total"]
+)
+
+print(runtime_summary, digits = 3)
+```
+
+Interpretation:
+
+* GHK is expected to be slower than GQT.
+* Misspecification may also change runtime if the likelihood becomes harder to optimize.
+
+---
+
+# Error messages for failed fits
+
+If any fits failed, inspect the error messages.
+
+```{r failed_fits}
+failed_df <- fit_df[!fit_df$converged, c(
+  "gen_family", "fit_family", "cell_label", "replicate", "method", "error_message"
+)]
+
+if (nrow(failed_df) == 0L) {
+  cat("No failed fits.\n")
+} else {
+  print(failed_df)
+}
+```
+
+---
+
+# Extract parameter estimates into long format
+
+The fitted estimates are stored in the list-column `fit_df$estimates`. We unpack them into one row per:
+
+* generating family,
+* fitting family,
+* replicate,
+* method,
+* parameter.
+
+We also attach a `truth` column where the comparison is well-defined.
+
+```{r extract_estimates}
+est_long <- extract_estimates_long(fit_df, fit_objects_named = fit_objects)
+
+dim(est_long)
+head(est_long)
+```
+
+---
+
+# What does the truth mean here?
+
+A key coding and interpretation point:
+
+* For **Poisson-generated** data, the generation truth stores `lambda = 5`, but the fitted Poisson intercept is on the **log scale**, so the correct fitting-scale truth is:
+  $$
+  \log(5) \approx 1.609.
+  $$
+
+* For **NegBin-generated** data, the current config uses:
+  $$
+  \beta = (\log(5), 0, 0),
+  $$
+  so the correct intercept-scale truth is again:
+  $$
+  \log(5) \approx 1.609.
+  $$
+
+* The range truth is always (0.3).
+
+* The overdispersion truth is only well-defined for the **NegBin-generated, NegBin-fitted** cell. For misspecified fits, some parameters do not have a meaningful “true” comparison, so their truth is set to `NA`.
+
+---
+
+# Which parameter names are present?
+
+Before summarizing estimates, it helps to see what parameter names `gcKrig` actually returned.
+
+```{r parameter_names}
+sort(unique(est_long$parameter))
+```
+
+---
+
+# Estimate summary by cell, method, and parameter
+
+```{r estimate_summary}
+estimate_tab <- aggregate(
+  estimate ~ gen_family + fit_family + cell_label + method + parameter,
+  data = est_long,
+  FUN = function(x) c(
+    mean   = mean(x),
+    sd     = sd(x),
+    median = stats::median(x),
+    n      = length(x)
+  )
+)
+
+estimate_summary <- data.frame(
+  gen_family = estimate_tab$gen_family,
+  fit_family = estimate_tab$fit_family,
+  cell_label = estimate_tab$cell_label,
+  method     = estimate_tab$method,
+  parameter  = estimate_tab$parameter,
+  mean_est   = estimate_tab$estimate[, "mean"],
+  sd_est     = estimate_tab$estimate[, "sd"],
+  median_est = estimate_tab$estimate[, "median"],
+  n          = estimate_tab$estimate[, "n"]
+)
+
+print(estimate_summary, digits = 3)
+```
+
+Interpretation:
+
+* In well-specified cells, the estimated means should lie near the truth.
+* In misspecified cells, the estimates may drift or become more variable.
+
+---
+
+# MAE summary
+
+Mean absolute error is only computed when a meaningful truth exists.
+
+```{r mae_summary}
+mae_df <- est_long[!is.na(est_long$truth), ]
+
+mae_tab <- aggregate(
+  abs_error ~ gen_family + fit_family + cell_label + method + parameter,
+  data = mae_df,
+  FUN = function(x) c(
+    mean   = mean(x),
+    median = stats::median(x),
+    sd     = sd(x),
+    n      = length(x)
+  )
+)
+
+mae_summary <- data.frame(
+  gen_family = mae_tab$gen_family,
+  fit_family = mae_tab$fit_family,
+  cell_label = mae_tab$cell_label,
+  method     = mae_tab$method,
+  parameter  = mae_tab$parameter,
+  mae_mean   = mae_tab$abs_error[, "mean"],
+  mae_median = mae_tab$abs_error[, "median"],
+  mae_sd     = mae_tab$abs_error[, "sd"],
+  n          = mae_tab$abs_error[, "n"]
+)
+
+print(mae_summary, digits = 3)
+```
+
+Interpretation:
+
+* In the well-specified cells, MAE is the main accuracy metric.
+* In misspecified cells, MAE is still interpretable for shared parameters like range and intercept-scale mean, but not always for parameters that only exist under one family.
+
+---
+
+# Information criteria summary
+
+AIC/BIC/AICc are recorded by the wrapper. These can be useful descriptively, but they should be interpreted carefully across misspecified families.
+
+```{r ic_summary}
+ic_df <- fit_df[fit_df$converged, ]
+
+ic_tab <- aggregate(
+  cbind(loglik, aic, bic, aicc) ~ gen_family + fit_family + cell_label + method,
+  data = ic_df,
+  FUN = mean
+)
+
+print(ic_tab, digits = 3)
+```
+
+---
+
+# Boxplots of runtime
+
+If `ggplot2` is available, produce a clean runtime plot. Otherwise use base graphics.
+
+```{r runtime_plot}
+if (requireNamespace("ggplot2", quietly = TRUE)) {
+  library(ggplot2)
+
+  ggplot(runtime_df, aes(x = method, y = runtime_sec, fill = method)) +
+    geom_boxplot(outlier.alpha = 0.5) +
+    facet_wrap(~ cell_label, scales = "free_y") +
+    labs(
+      title = "Runtime by method across Day 3 cells",
+      x = "Method",
+      y = "Runtime (seconds)"
+    ) +
+    theme_minimal()
+} else {
+  boxplot(
+    runtime_sec ~ interaction(cell_label, method),
+    data = runtime_df,
+    las = 2,
+    main = "Runtime by cell and method",
+    ylab = "Runtime (seconds)",
+    xlab = ""
+  )
+}
+```
+
+---
+
+# Boxplots of parameter estimates
+
+Again, use `ggplot2` if available.
+
+```{r estimate_plot}
+if (nrow(est_long) > 0) {
+  if (requireNamespace("ggplot2", quietly = TRUE)) {
+    library(ggplot2)
+
+    ggplot(est_long, aes(x = method, y = estimate, fill = method)) +
+      geom_boxplot(outlier.alpha = 0.5) +
+      facet_grid(parameter ~ cell_label, scales = "free_y") +
+      geom_hline(aes(yintercept = truth), colour = "red", linetype = 2, na.rm = TRUE) +
+      labs(
+        title = "Estimate distributions across Day 3 misspecification cells",
+        x = "Method",
+        y = "Estimate"
+      ) +
+      theme_minimal()
+  } else {
+    par(mfrow = c(1, 1))
+    boxplot(
+      estimate ~ interaction(method, cell_label),
+      data = est_long,
+      las = 2,
+      main = "Estimate distributions",
+      ylab = "Estimate",
+      xlab = ""
+    )
+  }
+}
+```
+
+Interpretation:
+
+* The dashed red line is the truth where defined.
+* In well-specified cells, boxes should be centered closer to the red line.
+* In misspecified cells, the distributions may shift or widen.
+
+---
+
+# A simple 2 x 2 Day 3 summary table
+
+This is the most report-like table in the document.
+
+It focuses on:
+
+* convergence,
+* mean runtime,
+* mean MAE for the parameters where truth exists.
+
+```{r day3_summary_table}
+# convergence
+conv_small <- convergence_summary[, c("cell_label", "method", "conv_rate")]
+
+# runtime
+rt_small <- runtime_summary[, c("cell_label", "method", "mean_sec")]
+
+# MAE
+mae_small <- mae_summary[, c("cell_label", "method", "parameter", "mae_mean")]
+
+# merge convergence + runtime first
+cell_method_tab <- merge(conv_small, rt_small, by = c("cell_label", "method"), all = TRUE)
+
+# reshape MAE wider by parameter
+if (nrow(mae_small) > 0) {
+  mae_wide <- reshape(
+    mae_small,
+    idvar = c("cell_label", "method"),
+    timevar = "parameter",
+    direction = "wide"
+  )
+
+  day3_summary <- merge(cell_method_tab, mae_wide, by = c("cell_label", "method"), all = TRUE)
+} else {
+  day3_summary <- cell_method_tab
+}
+
+print(day3_summary, digits = 3)
+```
+
+---
+
+# Interpretation guide
+
+At this stage, the most important comparisons are:
+
+## 1. Well-specified versus misspecified
+
+Compare:
+
+* Poisson ($\rightarrow$) Poisson versus Poisson ($\rightarrow$) NegBin
+* NegBin ($\rightarrow$) NegBin versus NegBin ($\rightarrow$) Poisson
+
+If the misspecified cell has:
+
+* worse convergence,
+* slower runtime,
+* larger MAE,
+* more variable estimates,
+
+then the misspecification study is already producing a meaningful result.
+
+## 2. GHK versus GQT under misspecification
+
+The Day 1 and Day 2 baseline focused on GHK versus GQT under correct specification.
+
+Day 3 asks a more robust question:
+
+> when the fitted marginal family is wrong, does GQT still behave similarly to GHK, or does one method degrade more severely?
+
+The key summaries for that are:
+
+* convergence rates,
+* runtime,
+* MAE,
+* estimate boxplots.
+
+## 3. Shared-parameter interpretation
+
+Some parameters remain comparable even under misspecification:
+
+* the intercept-scale mean parameter,
+* the spatial range.
+
+Other parameters are only meaningful under one family, especially overdispersion.
+
+So the cleanest Day 3 interpretation usually focuses first on:
+
+* range,
+* intercept-scale mean,
+* convergence,
+* runtime.
+
+---
+
+# Final takeaway
+
+The Day 3 misspecification pipeline is now doing exactly what it should:
+
+1. generate controlled Poisson and NegBin spatial count datasets,
+2. fit each under both correct and incorrect marginal assumptions,
+3. store one fit-result object per cell,
+4. summarize how misspecification affects stability, speed, and accuracy.
+
+This document is the analysis layer on top of that pipeline.
+
+---

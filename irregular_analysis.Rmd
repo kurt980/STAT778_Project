@@ -1,0 +1,196 @@
+---
+title: 'Irregular Sampling Analysis: Layout Effects on Estimation'
+author: "STAT778 Project"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: yes
+  html_document:
+    toc: yes
+    toc_float: yes
+    theme: flatly
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(message = TRUE, warning = FALSE,
+                      fig.width = 9, fig.height = 5)
+```
+
+## Purpose
+
+Compares estimation accuracy under three spatial layouts:
+
+- **Grid:** regular 7x7 (K13-A default).
+- **Random:** 49 uniform points in [0,1]^2.
+- **Clustered:** 49 points in 4 Gaussian clusters.
+
+All share the same generating parameters (Poisson lambda=5,
+range=0.3). Any difference in estimation accuracy therefore reflects
+the layout itself.
+
+---
+
+## Load and tidy
+
+```{r load}
+source("code/R/logging.R")
+source("code/R/io.R")
+source("code/R/fit_core.R")
+
+DATASET <- "IRREGULAR"
+ids <- list_scenarios(DATASET, dir = "data/generated")
+fits <- lapply(ids, function(id) load_fit_result(DATASET, id))
+names(fits) <- ids
+length(fits)
+```
+
+### Visualize the three layouts
+
+Before analysis, confirm the layouts look as intended.
+
+```{r plot_layouts, fig.width = 12, fig.height = 4}
+par(mfrow = c(1, length(fits)))
+
+for (id in names(fits)) {
+  locs <- fits[[id]]$scenario_config$layout
+  scen <- load_scenario(DATASET, id, dir = "data/generated")
+  plot(
+    scen$locations[, "x"], scen$locations[, "y"],
+    pch = 19, cex = 1.2, col = "steelblue",
+    xlab = "x", ylab = "y",
+    xlim = c(0, 1), ylim = c(0, 1),
+    main = sprintf("%s (n=%d)", id, nrow(scen$locations))
+  )
+}
+par(mfrow = c(1, 1))
+```
+
+### Tidy
+
+```{r tidy}
+tidy_one <- function(f) {
+  r <- f$results
+  cfg <- f$scenario_config
+
+  rows <- list()
+  for (i in seq_len(nrow(r))) {
+    if (!r$converged[i]) next
+    est <- r$estimates[[i]]
+    if (is.null(est) || length(est) == 0) next
+    for (pname in names(est)) {
+      rows[[length(rows) + 1]] <- data.frame(
+        scenario_id = f$scenario_id,
+        layout_type = cfg$layout$layout_type,
+        replicate   = r$replicate[i],
+        method      = r$method[i],
+        runtime_sec = r$runtime_sec[i],
+        parameter   = pname,
+        estimate    = as.numeric(est[[pname]]),
+        stringsAsFactors = FALSE
+      )
+    }
+  }
+  do.call(rbind, rows)
+}
+
+long <- do.call(rbind, lapply(fits, tidy_one))
+
+long$truth <- NA_real_
+long$truth[long$parameter %in% "Intercept"] <- log(5)
+long$truth[long$parameter %in% "range"]     <- 0.3
+
+long$abs_err <- abs(long$estimate - long$truth)
+long$err     <- long$estimate - long$truth
+```
+
+---
+
+## MAE by layout
+
+```{r mae}
+mae_tab <- aggregate(
+  abs_err ~ scenario_id + method + parameter,
+  data = long,
+  FUN  = mean
+)
+names(mae_tab)[4] <- "MAE"
+mae_tab[order(mae_tab$parameter, mae_tab$scenario_id, mae_tab$method), ]
+```
+
+### Figure
+
+```{r plot_mae, fig.width = 9, fig.height = 5}
+par(mfrow = c(1, 2))
+
+for (param in c("Intercept", "range")) {
+  d <- mae_tab[mae_tab$parameter == param, ]
+  layouts <- c("grid", "random", "clustered")
+  d$scenario_id <- factor(d$scenario_id, levels = layouts)
+
+  wide <- reshape(d[, c("scenario_id", "method", "MAE")],
+                  idvar = "scenario_id", timevar = "method",
+                  direction = "wide")
+
+  mat <- rbind(wide$MAE.GHK, wide$MAE.GQT)
+  colnames(mat) <- wide$scenario_id
+  rownames(mat) <- c("GHK", "GQT")
+
+  barplot(
+    mat, beside = TRUE,
+    col = c("firebrick", "steelblue"),
+    ylab = "MAE", main = sprintf("MAE by layout -- %s", param),
+    legend.text = rownames(mat),
+    args.legend = list(x = "topright", bty = "n")
+  )
+}
+par(mfrow = c(1, 1))
+```
+
+---
+
+## Bias by layout
+
+```{r bias}
+bias_tab <- aggregate(
+  err ~ scenario_id + method + parameter,
+  data = long,
+  FUN  = mean
+)
+names(bias_tab)[4] <- "bias"
+bias_tab
+```
+
+Regular grid baseline: bias should be near zero for both parameters.
+Random layout: expected similar. Clustered: might show more bias
+(especially in range) because clustered point patterns have a
+different distribution of pairwise distances.
+
+---
+
+## Summary
+
+```{r summary}
+cat("=== Irregular sampling summary ===\n\n")
+
+for (layout in c("grid", "random", "clustered")) {
+  cat(sprintf("\n-- %s --\n", layout))
+  for (param in c("Intercept", "range")) {
+    for (m in c("GHK", "GQT")) {
+      mae_val <- mean(long$abs_err[long$scenario_id == layout &
+                                   long$parameter == param &
+                                   long$method == m], na.rm = TRUE)
+      cat(sprintf("  %-9s  %s  MAE=%.4f\n", param, m, mae_val))
+    }
+  }
+}
+```
+
+### Likely findings
+
+Fill in:
+
+1. All three layouts maintain ___% convergence.
+2. Random layout produces MAE ___ (similar to / worse than) grid.
+3. Clustered layout ___ (the expected issue is worse range
+   identification, since clustered points have fewer large
+   distances to probe the correlation at its tail).

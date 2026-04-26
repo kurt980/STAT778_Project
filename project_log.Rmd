@@ -1,0 +1,385 @@
+---
+title: "STAT778 Project: Development Log"
+author: "Chengyan (Kurt) Ji"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(echo = FALSE, eval = FALSE)
+```
+
+## Purpose of this log
+
+A chronological record of the project's development: what was built, what broke, how each issue was resolved, and what general lessons are worth carrying into the report. The entries are in rough chronological order within the project week.
+
+---
+
+## Phase 1: Design and scope decisions
+
+**Reproduction plan.** Organized reproduction targets into two tiers. Tier 1 (must reproduce) contains H18-B, Han and De Oliveira (2018) Section 4.4, as a pipeline warm-up, and K13-A, Kazianka (2013) Section 4, as the main estimation study. Tier 2 (strongly useful) contained K13-B and K13-C, the Poisson and Bernoulli prediction-accuracy studies from Kazianka (2013) Section 5.
+
+**Scope refinements, in order of adoption:**
+
+1. Geometric marginal dropped from Kazianka's original three-family grid (Poisson, Bernoulli, geometric). gcKrig has no built-in geometric marginal, and Poisson + Bernoulli already contrasts unbounded vs binary support.
+2. K13-B and K13-C postponed after K13-A reproduction to prioritize a robustness extension (misspecification) over additional reproductions.
+3. Paper's 54-cell, 2000-replicate grid reduced to 18 cells at 200 replicates (Poisson only, n in {25, 49}, range in {0.1, 0.3, 0.5}, lambda in {1, 5, 10}). Rationale: compute budget; full grid would require on the order of 100,000 fits.
+
+**Architecture.** Settled on a two-level identity scheme: `dataset_id` names the family (e.g., "H18-B", "K13-A"), `scenario_id` names the specific cell within the family (e.g., "default"). Every generated simulation lands at `data/generated/<dataset_id>/<scenario_id>.rds`; every fit result lands at `data/fits/<dataset_id>/<scenario_id>.rds`. This keeps the repository tidy as the grid expands.
+
+---
+
+## Phase 2: Pipeline construction
+
+### H18-B: pipeline warm-up
+
+**Goal.** Reproduce a single-draw negative-binomial realization on an 11x11 grid as a smoke test of the generation pipeline.
+
+**Deliverables.** Library modules for logging, location building, scenario schema (`make_scenario()`), Monte Carlo simulation (`simulate_mc_scenario()` wrapping `gcKrig::simgc`), and I/O, plus a dataset-specific config and script.
+
+**Design decision.** Every saved scenario stores the full input config verbatim in `$config`, in addition to any normalized or convenience-extracted fields. Motivation: future extensions add new spec fields (missingness, contamination, anisotropy) that we don't want to manually add to a schema each time. Round-trip fidelity is guaranteed by construction.
+
+### K13-A: first Monte Carlo cell
+
+**Goal.** Reproduce Kazianka (2013) Section 4's main estimation study at one pilot cell, Poisson lambda = 5, n = 49, range = 0.3, sim_n = 30, comparing GHK and GQT on parameter recovery and runtime.
+
+**Deliverables.** Poisson marginal support added to `build_marginal()` (extended from H18-B's negbin only).
+
+**Setback: simgc output-shape surprise.** `gcKrig::simgc()` returns a `sim_n x n` matrix (one row per replicate) when `sim_n > 1`, but a length-`n` vector when `sim_n == 1`. Our `simulate_mc_scenario` was written assuming `n x sim_n`, which passed tests on H18-B (`sim_n = 1`, so orientation was moot) but failed on K13-A.
+
+**Resolution.** Added defensive shape detection in `simulate_mc_scenario()`:
+
+```{}
+values <- if (is.matrix(raw)) {
+  if (nrow(raw) == spec$sim_n && ncol(raw) == nrow(locations)) {
+    t(raw)
+  } else if (nrow(raw) == nrow(locations) && ncol(raw) == spec$sim_n) {
+    raw
+  } else {
+    stop(...)
+  }
+} else {
+  matrix(raw, ncol = 1L)
+}
+```
+
+**Lesson.** When defining a shape invariant for intermediate data, write a test case that actually exercises the non-trivial dimension. A single-replicate smoke test does not validate orientation logic.
+
+### Fitting pipeline: `fit_core.R`
+
+**Goal.** Convert a scenario's simulated data into parameter estimates via `gcKrig::mlegc()`, structured so any scenario from any dataset can be fit with any method.
+
+**Design decisions:**
+
+1. **Fit-result schema parallel to scenario schema.** One row per (replicate, method) pair, stored as a tidy data frame with list columns for estimates and standard errors, which handles family-specific parameter sets without requiring a wide format.
+2. **Error-tolerant per-fit processing.** A single replicate's failure does not abort the whole scenario. `tryCatch` around `mlegc()` records the error message, sets `converged = FALSE`, and moves on.
+3. **SE computation from the Hessian.** `mlegc` does not store standard errors as a separate field; they must be computed as `sqrt(diag(solve(fit$hessian)))`. This is captured inside `.fit_one()`.
+
+### Setback: `poisson.gc(link = ...)` fails
+
+**Symptom.** Initial smoke test of K13-A fitting:
+
+```{}
+Error in poisson(substitute(link)) : link "substitute(link)" not
+available for poisson family; available links are 'log', 'identity',
+'sqrt'
+```
+
+**Diagnosis.** `poisson.gc` internally calls `substitute(link)` on its argument, expecting an unquoted symbol, not a character string. Passing `link = "log"` produces the literal string `"substitute(link)"` because the default is retrieved inside the function wrapper rather than at call time.
+
+**Resolution.** Drop the `link` argument entirely. Every family's default link is what we want anyway. The fix was a single-line simplification:
+
+```{}
+return(poisson.gc())           # not poisson.gc(link = "log")
+```
+
+**Lesson.** Statistical packages sometimes have non-standard evaluation semantics that don't compose cleanly with wrapper code. When in doubt, run the intended call at the R console first to confirm the argument-passing convention.
+
+---
+
+## Phase 3: Environment and infrastructure
+
+### Hopper setup
+
+**Goal.** Run the pipeline as Slurm batch jobs on GMU's Hopper cluster.
+
+**Deliverables.** Per-script Slurm submission scripts, a shared `_env.sh` for module loading and environment variables, and a logs directory convention (`logs/%x-%j.out`).
+
+### Setback: renv lockfile / R version mismatch
+
+**Symptom.** Initial Slurm run: `gcKrig` not found on the expected library path. Log showed `.libPaths()` pointing to `renv/library/R-4.3/...` while the stored library was at `renv/library/R-4.1/...`.
+
+**Diagnosis.** The project's `renv.lock` pinned R 4.1.1, but Hopper's available R module was 4.3.1. `renv` autoloaded on R startup and resolved the library path for the current R version (4.3), finding an empty directory.
+
+**Resolution attempt 1 (failed).** `renv::restore()` to install every pinned package under R 4.3. Hit a 404 on the archived `Rcpp 1.1.1` tarball from a 2021 RSPM snapshot. Older versions had been archived out.
+
+**Resolution attempt 2 (succeeded for gcKrig, failed for gcmr).** Deleted `renv.lock`, ran `install.packages("gcKrig", "gcmr")` fresh, then `renv::snapshot()`. `gcKrig` installed cleanly in about 45 minutes (slow login node compile). `gcmr` failed because its dependency chain (`MatrixModels` -> `quantreg` -> `car` -> `gcmr`) hit a missing system library on `MatrixModels`.
+
+**Pragmatic decision.** Dropped `gcmr` from the project. It is only used in Han's Section 4.4 benchmark comparison, which is not central to the simulation study's thesis. The report will cite Han's published timings rather than reproducing them.
+
+**Lesson.** Strict reproducibility via pinned-version lockfiles is desirable, but lockfiles decay: archived package versions become unreachable as repositories age. A practical workflow is to pin only what you're running now, regenerate the lockfile per R version you use, and commit both the generating environment metadata (R version, OS, platform) and the lockfile.
+
+### Slurm path resolution
+
+**Design decision.** Scripts resolve the project root via a priority chain: `$GCKRIG_PROJECT_ROOT` -> `$SLURM_SUBMIT_DIR` -> `getwd()`. This way the same script works interactively (from `setwd()`), under Slurm (`SLURM_SUBMIT_DIR` is set automatically by `sbatch`), and in Docker/container environments (explicit override via `GCKRIG_PROJECT_ROOT`).
+
+### Rmd vs Slurm workflow
+
+Settled on: Rmd for development, smoke tests, and final analysis. Slurm for production scaling. Chunks marked `eval = FALSE` for long-running work so that a Knit completes quickly on cheap work only; the developer clicks the green arrow manually when ready for the expensive chunk.
+
+---
+
+## Phase 4: K13-A execution (Day 1 + Day 2)
+
+### Day 1: pilot at sim_n = 30
+
+**Result.** All 60 fits (30 replicates, 2 methods) converged. GHK mean runtime about 0.5 sec; GQT about 0.13 sec. On Kazianka's reported 2013 hardware GHK took about 320 sec per fit, so the observed 600x speedup reflects a decade of CPU improvement plus gcKrig's optimized C++ implementation (Kazianka used a MATLAB toolbox).
+
+### Issue: "truth" not shown on boxplot
+
+**Symptom.** Parameter-estimate boxplots showed the range reference line at the correct value (0.3) but reported "truth = ?" for the Intercept.
+
+**Diagnosis.** Scenario stored true lambda = 5. gcKrig returns estimate on the log scale as `Intercept`. `truth$Intercept` was absent; `truth$lambda` was present but the plotting code looked up by parameter name.
+
+**Resolution.** One-line addition to the MAE computation:
+
+```{}
+if (!is.null(truth$lambda)) {
+  truth$Intercept <- log(truth$lambda)
+}
+```
+
+**Lesson for the report.** Document the parameterization explicitly. gcKrig's Poisson model estimates `log(lambda) = beta_0`, so estimates and truth must be compared on the same scale. This is documented in our intro section with the relationship `lambda = exp(beta_0)` and the specific value `log(5) = 1.609`.
+
+### Day 2: scale-up to sim_n = 200
+
+**Result.** Completed overnight on Hopper with no new issues. All 400 fits converged. Runtime and convergence behavior extrapolated cleanly from the Day 1 pilot. This validates the fitting infrastructure at the intended production scale.
+
+---
+
+## Phase 5: Misspecification study (Day 3)
+
+### Design
+
+**Goal.** Quantify how much damage is done to estimation when the fitted marginal family differs from the generating family. Chose a 2x2 factorial: Poisson and negative binomial as generating families, crossed with Poisson and negative binomial as fitting families. Four cells total, two well-specified (diagonal) and two misspecified (off-diagonal).
+
+**Architectural change.** Extended `fit_scenario()` to accept an optional `fit_marginal_spec` argument overriding the scenario's native generating family. When NULL (default), fitting uses the scenario's generating family, preserving backward compatibility. When non-NULL, fitting uses the override. An `is_misspecified()` helper and a `misspecified` field on the fit-result object record the setup automatically.
+
+### Observation: overdispersion-boundary warning
+
+**Symptom.** Fitting negative binomial to Poisson-generated data consistently triggered:
+
+> Estimated Standard Deviation of the Overdispersion Parameter may
+> NOT Reliable Since its MLE is closed to the Boundary of Parameter
+> Space!
+
+**Interpretation.** This is not a bug. When the generating distribution is Poisson, there is no overdispersion in the data. Negative binomial's overdispersion parameter has no signal to estimate and gets pushed toward zero, its boundary. Standard error calculations become unstable near that boundary. This is exactly the expected symptom of fitting a more flexible model to data from a simpler one, and it becomes a finding in its own right in the misspecification analysis.
+
+### Setback: SE list-column bug
+
+**Symptom.** On the fourth replicate of cell 3 (generate negbin, fit negbin), the fitting loop crashed:
+
+```{}
+Error in $<-.data.frame(*tmp*, "std_errors", value = list()) :
+  replacement has 0 rows, data has 1
+```
+
+**Diagnosis.** R's idiosyncratic list-column semantics. The code was:
+
+```{}
+out$std_errors[[1]] <- tryCatch(<SE calculation>, error = function(e) NULL)
+```
+
+When the `tryCatch` block returned `NULL`, which happens when the Hessian is singular and `solve()` errors, this is equivalent to `x[[1]] <- NULL`, which in R *removes* list element 1 rather than setting it to NULL. This leaves the data frame with a zero-length list column and a one-row scalar column, hence "replacement has 0 rows, data has 1" at the next row operation.
+
+**Resolution.** Assign the entire column as a single-element list rather than indexing into it:
+
+```{}
+se_val <- tryCatch(...)
+out$std_errors <- list(se_val)
+```
+
+This idiom explicitly creates a length-1 list-column cell, even when the contents are NULL, preserving the data frame's row count.
+
+The same fix was applied to the `estimates` column for symmetry, although that column had not yet triggered the bug.
+
+**Lesson worth including in the report.** Fitting infrastructure for misspecification studies requires defensive handling of numerical failure modes specific to the misspecification being tested, here, singular Hessians when overdispersion pegs at its boundary. Robust list-column handling in R's `data.frame` is separately subtle enough that one should prefer `df$col <- list(x)` over `df$col[[1]] <- x` whenever the right-hand side could be NULL.
+
+---
+
+## Phase 6: Grid expansion (Day 4)
+
+### Design
+
+**Scope.** 18 cells spanning n in {25, 49}, range in {0.1, 0.3, 0.5}, lambda in {1, 5, 10}. Used a new `dataset_id = "K13A-GRID"` to keep grid results separate from the Day-1 pilot.
+
+**Estimated compute.** 18 cells x 200 replicates x 2 methods = 7,200 fits. At observed 0.5-1 sec/fit, 60-180 minutes of wall time. Budgeted the Slurm job at 12 hours for safety.
+
+**Status at time of writing this log.** Day 4 submitted as an overnight job; awaiting results.
+
+---
+
+## Outstanding items
+
+### Decisions made
+
+* H18-B fitting: skipped. Would require re-running `mlegc` on one realization just to produce benchmark numbers already covered by K13-A's fitting infrastructure. No analytical contribution.
+* K13-B and K13-C: postponed. Prediction-accuracy studies from Kazianka Section 5. Cheap to run but tangential; the report cites the original paper's results.
+
+### For the analysis phase
+
+When the Day-4 grid fits complete, the analysis tasks ahead are:
+
+1. Load all fit-result files via `list_fit_results(...)` and `lapply(load_fit_result, ...)`.
+2. Tidy into a long-format data frame keyed by `(dataset_id, scenario_id, misspec_family, method, replicate, parameter)`.
+3. Compute per-cell MAE, bias, runtime summary, convergence rate.
+4. Produce the Kazianka-style Figure 1 (MAE vs. sample size, faceted by range, lines by lambda).
+5. Produce the misspecification comparison table (well-specified vs. misspecified, for each direction).
+6. Draft the report's simulation results section.
+
+### Cross-cutting lessons to retain for the report
+
+1. **Orientation matters under replication.** Shape assumptions that pass tests at `sim_n = 1` can break at `sim_n > 1`.
+2. **Non-standard evaluation lurks in R packages.** A working call at the console is worth more than a working call in theory.
+3. **Lockfile pinning decays over time.** Regenerate environments per R version, keep `renv.lock` thin.
+4. **Misspecification diagnostics are meaningful, not just noise.** Near-boundary SE warnings are the symptom of the phenomenon we are studying; do not suppress them.
+5. **List-column assignment in R has NULL-drop semantics.** Prefer `df$col <- list(x)` over `df$col[[1]] <- x` when `x` could be NULL.
+
+
+---
+
+---
+
+## Phase 7: K13A-GRID analysis and the MISSING extension
+
+### K13A-GRID analysis infrastructure
+
+**Goal.** Tidy and summarize the 18-cell grid study into tables and
+figures ready for the report.
+
+**Deliverables.** `k13a_grid_analysis.Rmd` at the repo root. Loads
+all 18 fit-result files, flattens the list-column format into a long
+data frame keyed by `(n, range, lambda, method, replicate,
+parameter)`, then computes convergence rates, runtime tables, MAE
+and bias tables, GHK-vs-GQT comparison tables, and Kazianka-style
+MAE-vs-n plots.
+
+**Design decision: the three-part pipeline.** Formally recognized
+that every dataset family now follows `generation -> fitting ->
+analysis`, with each stage living in separate files. Walkthroughs
+are a fourth, optional mode (pedagogical; skippable once a dataset
+is understood). Starting with K13A-GRID, new extensions get this
+full pipeline template.
+
+### Setback: NA-as-index error in the analysis Rmd
+
+**Symptom.** On first run, the `attach_truth` chunk errored:
+```
+Error in long$truth[long$parameter == "Intercept"] <- log(...) :
+  NAs are not allowed in subscripted assignments
+```
+
+**Diagnosis.** Inside `tidy_one()`, failed fits produce a row with
+`parameter = NA_character_` so that failures remain visible
+downstream. But `NA == "Intercept"` returns NA (not FALSE), and R
+refuses logical subscripts containing NA.
+
+**Resolution.** Replaced `long$parameter == "X"` with
+`long$parameter %in% "X"`. `%in%` returns FALSE for NA, which is
+what we want (failed rows don't match anything and stay at their
+default `NA_real_` truth).
+
+**Lesson.** When a column can contain NA, prefer `%in%` over `==`
+for subsetting. `NA` propagation through `==` breaks downstream
+logical indexing in a way that's not immediately obvious, especially
+in tidy pipelines.
+
+---
+
+## Phase 8: Scope audit and extension selection
+
+Stepping back to confirm progress against the original planning
+document. The plan listed 8 candidate scenarios; K13A-GRID covered
+sample size and dependence strength, MISSPEC covered misspecification.
+That leaves 6 outstanding.
+
+**Scope decisions.**
+
+- Missingness, zero-inflation, irregular sampling: confirmed for
+  this phase. Each is cheap to add on top of existing infrastructure.
+- Anisotropy: tentative. Would require either a coordinate transform
+  hook or custom covariance; hook already exists but isn't wired up.
+- Nonstationarity: dropped. Requires building a parallel simulation
+  pipeline outside gcKrig. Not justified given remaining time.
+- K13-B and K13-C (Kazianka prediction studies): dropped. Would
+  require a new predgc-based pipeline with no analytical contribution
+  to the robustness thesis.
+
+### Design rationale for the three extensions
+
+All three extensions fit the existing three-part pipeline. Missingness
+masks values post-generation; zero-inflation swaps the marginal
+family; irregular sampling adds a new layout type. No new
+library concepts needed beyond what's already there.
+
+---
+
+## Phase 9: Missingness (MCAR) extension
+
+### Design
+
+**Mechanism.** MCAR: each replicate randomly drops a fixed fraction
+of observations, independent of their values. Estimators should
+remain unbiased, only their variance grows.
+
+**Study axis.** Five rates: 0%, 10%, 20%, 30%, 50%. All scenarios
+share the same seed so the underlying simulation is identical
+across rates; only the mask pattern changes. Makes "same data,
+increasingly incomplete" the clean comparison.
+
+### Deliverables
+
+- `code/R/missingness.R`: `apply_mcar()` post-generation hook.
+- `code/configs/missing.R`: 5-rate builder.
+- `code/scripts/05_gen_missing.R`: generation.
+- `code/scripts/13_fit_missing.R`: fitting.
+- `code/slurm/`: both Slurm scripts.
+- `missing_walkthrough.Rmd`: interactive pipeline tour.
+- `missing_analysis.Rmd`: tables and figures.
+
+### fit_core.R modification
+
+`.fit_one()` now drops NA rows from y and locs before calling
+`mlegc`. This lets the fitter consume masked scenarios
+transparently — no caller-side code change needed. Added `n_used`
+column to the fit-result schema so analysis can distinguish
+"full n" from "effective n after masking."
+
+**Backward compatibility.** Existing K13-A and MISSPEC fit results
+still load. The `n_used` column is absent from those older results
+but `fr$results$n_used` returns NA rather than erroring, so
+analysis code is safe as long as it doesn't require non-NA `n_used`.
+
+---
+
+## Cross-cutting lessons accumulating
+
+Updated list for the report's methodology section:
+
+1. Orientation matters under replication (surfaced at sim_n > 1).
+2. Non-standard evaluation lurks in R packages (poisson.gc `link`).
+3. Lockfile pinning decays (archived package versions disappear).
+4. Misspecification diagnostics are meaningful signals, not noise.
+5. List-column assignment in R has NULL-drop semantics (`df$col[[1]]
+   <- NULL` removes the cell; prefer `df$col <- list(x)`).
+6. NA columns plus logical subsetting equals silent breakage; prefer
+   `%in%` over `==`.
+7. Post-generation hooks (missingness, contamination) integrate
+   cleanly if the fitter is built to ignore NAs from the start. The
+   scenario schema's `values_full` field pays off here.
+
