@@ -383,3 +383,203 @@ Updated list for the report's methodology section:
    cleanly if the fitter is built to ignore NAs from the start. The
    scenario schema's `values_full` field pays off here.
 
+---
+
+## Phase 10: Zero-inflation extension
+
+### Design
+
+**Goal.** Test what happens when the data-generating process has
+excess zeros (zero-inflated Poisson, ZIP) and the analyst either
+correctly assumes ZIP or misspecifies as plain Poisson.
+
+**Study axis.** Three zero-inflation levels: p0 = 0, 0.2, 0.4. The
+p0 = 0 cell is a sanity check; ZIP with p0=0 should degenerate to
+Poisson and produce essentially identical results to K13-A.
+
+**Pipeline reuse.** The misspecification machinery built in Phase 5
+(the `fit_marginal_spec` override) handles the ZIP-vs-Poisson
+contrast directly. Each generated scenario is fit twice: once as
+ZIP (well-specified when p0 > 0), once as Poisson (misspecified
+when p0 > 0). Same `fit_scenario()` call, different
+`fit_marginal_spec`.
+
+### Setback: zip.gc argument name
+
+**Symptom.** Smoke test of `zip.gc(lambda = 5, od = 0.2)` failed:
+```
+Error in zip.gc(lambda = 5, od = 0.2) : unused argument (lambda = 5)
+```
+
+**Diagnosis.** gcKrig's ZIP marginal does not use `lambda` as the
+argument name. Confirmed by inspecting `args(zip.gc)`. The actual
+parameter name is `mu`, matching the convention used by `negbin.gc`
+rather than `poisson.gc`.
+
+**Resolution.** Updated `06_gen_zip.R`'s `build_marginal()` to
+translate the spec's `lambda` field into the gcKrig call's `mu`
+argument:
+```
+return(zip.gc(mu = marg_spec$lambda, od = marg_spec$od))
+```
+The config's internal field name (`lambda`) was kept as-is for
+naming consistency with other Poisson-like specs; only the
+gcKrig-facing translation changed.
+
+**Lesson.** Each gcKrig marginal constructor has its own argument
+naming conventions: `poisson.gc(lambda)`, `negbin.gc(mu, od)`,
+`zip.gc(mu, od)`. The package documentation is the only reliable
+source. Argument names from one constructor cannot be assumed to
+transfer to another.
+
+### Deliverables
+
+- `code/configs/zip.R`: 3-level builder.
+- `code/scripts/06_gen_zip.R`: generation.
+- `code/scripts/14_fit_zip.R`: fitting (well-specified + misspecified
+  per scenario).
+- `code/slurm/`: both Slurm scripts.
+- `zip_analysis.Rmd`: tables and figures.
+
+---
+
+## Phase 11: Irregular sampling extension
+
+### Design
+
+**Goal.** Test whether estimation accuracy depends on the spatial
+layout of observations. Three layouts at the same n=49 and same
+generating model: regular 7x7 grid (the K13-A baseline), uniformly
+random points, and points sampled from a 4-cluster Gaussian mixture.
+
+**Architectural change.** Extended `make_locations()` in
+`code/R/grids.R` with two new branches: `random_uniform` and
+`clustered`. The dispatch design from Phase 2 paid off — adding
+new layout types required no changes to existing scenarios or
+callers; both branches just expose new entries in the same
+dispatch.
+
+**Layout reproducibility.** Both new branches require an explicit
+seed (no default), since random layouts without seeds make
+results non-reproducible. The seed is independent of the
+simulation seed, so the same layout can be reused across
+different generative parameters.
+
+### Deliverables
+
+- `code/R/grids.R`: extended with `random_uniform`, `clustered`.
+- `code/configs/irregular.R`: 3-layout builder.
+- `code/scripts/07_gen_irregular.R`: generation.
+- `code/scripts/15_fit_irregular.R`: fitting.
+- `code/slurm/`: both Slurm scripts.
+- `irregular_analysis.Rmd`: tables and figures.
+
+---
+
+## Phase 12: Analysis Rmds and visualization helpers
+
+### Goal
+
+By this phase, six datasets had `.rds` files on disk (H18-B, K13-A
+pilot, K13A-GRID, MISSPEC, MISSING, ZIP, IRREGULAR — H18-B has no
+fit results, so seven scenario sets but six fit-result sets).
+Producing report tables and figures required a parallel set of
+analysis Rmds.
+
+### Pattern that emerged
+
+Every analysis Rmd follows the same template:
+
+1. Load every fit-result file via `list_fit_results()` and
+   `lapply(load_fit_result, ...)`.
+2. Tidy each result via a `tidy_one()` function: one row per
+   (replicate, method, parameter), expanding the list-column
+   estimates.
+3. Attach truth values, converting between scales as needed
+   (e.g., `truth$Intercept = log(truth$lambda)`).
+4. Aggregate to per-cell MAE, bias, runtime, convergence tables.
+5. Produce headline figures.
+
+The MISSPEC analysis Rmd was written separately (not by the
+generation/fitting tooling); the K13A-GRID, MISSING, ZIP, and
+IRREGULAR analysis Rmds followed the same template.
+
+### plot_helpers.R
+
+Promoted `save_base_plot()` from being inline in walkthrough Rmds
+to a shared library file at `code/R/plot_helpers.R`. The function
+captures the awkwardness of saving base-R plots — they must be
+replayed inside each graphics device — into a single helper that
+accepts a quoted plotting expression. This avoids the bug-prone
+pattern where inline-displayed and disk-saved versions of a plot
+diverge.
+
+---
+
+## Phase 13: Documentation and final scope
+
+### README
+
+Wrote a comprehensive `README.md` covering: quick reproduction
+sequence (clone-to-rendered-Rmds in one block), repository layout,
+the three categories of Rmd files (analysis vs walkthrough vs log),
+environment setup including the three-lockfile situation,
+conventions used throughout the codebase.
+
+### Final scope confirmation
+
+After the irregular-sampling extension, the project's scope was
+finalized:
+
+- **Reproduced:** K13-A baseline (pilot + 18-cell grid).
+- **Extensions completed:** misspecification, missingness (MCAR),
+  zero-inflation, irregular sampling.
+- **Extensions dropped:** anisotropy (the coord-transform hook
+  exists in `simulate_mc_scenario` but was never wired to a
+  specific study; deferred indefinitely), nonstationarity (always
+  out of scope; would have required a parallel simulation pipeline
+  outside gcKrig), K13-B and K13-C prediction studies (dropped
+  earlier; tangential to the robustness thesis).
+
+Against the planning document's eight-bullet list, the project
+covers four bullets fully (misspec, dependence, missingness, zero
+inflation) and one partially (sampling design — random and
+clustered done; sparse not separately tested). Anisotropy,
+nonstationarity, and outliers (a third form of contamination
+beyond zero-inflation) remain untouched.
+
+---
+
+## Cross-cutting lessons (final)
+
+Updated list for the report's methodology section:
+
+1. **Orientation matters under replication.** Shape assumptions
+   that pass tests at `sim_n = 1` can break at `sim_n > 1`.
+2. **Non-standard evaluation lurks in R packages.** A working call
+   at the console is worth more than a working call in theory.
+3. **Argument names are package-specific, not concept-specific.**
+   `poisson.gc` uses `lambda`; `negbin.gc` and `zip.gc` use `mu`.
+   Each constructor's documentation is the only reliable source.
+4. **Lockfile pinning decays over time.** Regenerate environments
+   per R version, keep `renv.lock` thin.
+5. **Misspecification diagnostics are meaningful signals, not noise.**
+   Near-boundary SE warnings are the symptom of the phenomenon we
+   are studying; they should be reported, not suppressed.
+6. **List-column assignment in R has NULL-drop semantics.** Prefer
+   `df$col <- list(x)` over `df$col[[1]] <- x` when `x` could be
+   NULL.
+7. **NA columns plus logical subsetting equals silent breakage.**
+   Prefer `%in%` over `==` for any subsetting on a column that
+   could contain NA.
+8. **Post-generation hooks (missingness, masking) integrate cleanly
+   if the fitter is built to ignore NAs from the start.** The
+   scenario schema's `values_full` field — initially designed
+   speculatively as a placeholder — paid off when missingness was
+   actually implemented.
+9. **Dispatch-style architecture pays off when extensions arrive.**
+   `make_locations()`'s switch on `layout_type` was originally
+   built for one layout (regular grid). Adding `random_uniform`
+   and `clustered` later required zero changes to existing
+   callers — only new dispatch branches.
+   

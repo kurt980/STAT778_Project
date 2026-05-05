@@ -189,8 +189,8 @@ par(mfrow = c(1, 1))
 
 ### Save
 
-```{r save_fig, eval = FALSE}
-dir.create("visualization/zip", recursive = TRUE, showWarnings = FALSE)
+```{r save_fig, eval = TRUE}
+dir.create("visualization/zip", recursive = TRUE, showWarnings = TRUE)
 pdf("visualization/zip/mae_vs_p0.pdf", width = 10, height = 5)
 # <paste the plot_mae code here>
 dev.off()

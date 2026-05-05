@@ -1,0 +1,19 @@
+"cell_label","method","parameter","MAE"
+"negbin -> negbin","GHK","Intercept",0.404715234811718
+"negbin -> negbin","GQT","Intercept",0.396251635928491
+"negbin -> poisson","GHK","Intercept",0.444716073000541
+"negbin -> poisson","GQT","Intercept",0.433527228677988
+"poisson -> negbin","GHK","Intercept",0.161074350993246
+"poisson -> negbin","GQT","Intercept",0.161262926484888
+"poisson -> poisson","GHK","Intercept",0.157541541829626
+"poisson -> poisson","GQT","Intercept",0.159888646107765
+"negbin -> negbin","GHK","overdispersion",0.322766844772734
+"negbin -> negbin","GQT","overdispersion",0.455067758763101
+"negbin -> negbin","GHK","range",0.105201268562585
+"negbin -> negbin","GQT","range",0.150567034774151
+"negbin -> poisson","GHK","range",0.209877989050796
+"negbin -> poisson","GQT","range",0.207537858266886
+"poisson -> negbin","GHK","range",0.105332687343939
+"poisson -> negbin","GQT","range",0.108374820231641
+"poisson -> poisson","GHK","range",0.0827321162722494
+"poisson -> poisson","GQT","range",0.0794294501662767

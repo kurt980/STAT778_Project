@@ -1,0 +1,13 @@
+"p0","fit_family","method","converged"
+0,"poisson","GHK",1
+0,"poisson","GQT",1
+0.2,"poisson","GHK",1
+0.2,"poisson","GQT",1
+0.4,"poisson","GHK",1
+0.4,"poisson","GQT",1
+0,"zip","GHK",1
+0,"zip","GQT",1
+0.2,"zip","GHK",1
+0.2,"zip","GQT",0.995
+0.4,"zip","GHK",1
+0.4,"zip","GQT",0.995

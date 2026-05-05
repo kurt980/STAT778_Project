@@ -1,0 +1,13 @@
+"scenario_id","method","parameter","MAE"
+"clustered","GHK","Intercept",0.204940722911362
+"clustered","GQT","Intercept",0.199765817859312
+"grid","GHK","Intercept",0.142218003568385
+"grid","GQT","Intercept",0.139926611639045
+"random","GHK","Intercept",0.151014761048814
+"random","GQT","Intercept",0.15026109107635
+"clustered","GHK","range",0.0605271949323937
+"clustered","GQT","range",0.0581020577557749
+"grid","GHK","range",0.0639137341154988
+"grid","GQT","range",0.0626542482422051
+"random","GHK","range",0.0638153972028202
+"random","GQT","range",0.0610174220738655
