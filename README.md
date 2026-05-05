@@ -114,11 +114,10 @@ STAT778_Project/
 ├── analysis_04_irregular.Rmd        ← analysis Rmd for irregular spatial layouts
 ├── analysis_05_zip.Rmd              ← analysis Rmd for zero-inflation study
 │
-├── exploratory_analysis.Rmd         ← exploratory analysis / early checks
+├── exploratory_analysis.Rmd         ← exploratory analysis mostly for understanding gcKrig and Kazianka (2013)
 ├── pipeline_debugging.Rmd           ← debugging notes for the simulation pipeline
 ├── pipeline_readme.Rmd              ← pipeline overview / how to run the project
 ├── project_log.Rmd                  ← development log
-├── test.Rmd                         ← temporary testing file
 │
 ├── walkthrough_00_codebase.Rmd      ← codebase walkthrough (see below)
 ├── walkthrough_001_h18b.Rmd         ← H18B walkthrough
