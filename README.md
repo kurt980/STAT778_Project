@@ -5,9 +5,6 @@ test the robustness of `gcKrig` under realistic violations:
 misspecification of the marginal family, random missingness,
 zero-inflation, and irregular spatial sampling designs.
 
-The accompanying report (`report.pdf`) summarizes findings; this
-document describes how to reproduce them from source.
-
 ---
 
 ## Quick reproduction
